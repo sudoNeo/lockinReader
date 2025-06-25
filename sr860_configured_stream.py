@@ -86,9 +86,16 @@ class ProcessStreamReceiver:
                 header_bytes = packet_buffer[:4]
                 header = (header_bytes[0] << 24) | (header_bytes[1] << 16) | (header_bytes[2] << 8) | header_bytes[3]
                 
-                # Extract fields
+                # Extract fields according to SR860 manual
                 packet_counter = header & 0xFF
                 sample_rate_code = (header >> 16) & 0xFF
+                
+                # Extract status bits (bits 24-31)
+                status = (header >> 24) & 0xFF
+                is_little_endian = bool(status & 0x10)  # Bit 28
+                has_integrity_check = bool(status & 0x20)  # Bit 29
+                has_overload = bool(status & 0x01)  # Bit 24
+                has_error = bool(status & 0x02)  # Bit 25
                 
                 # Calculate samples
                 data_bytes = bytes_received - 4
@@ -103,11 +110,31 @@ class ProcessStreamReceiver:
                     stats.rate_code_counts = {}
                 stats.rate_code_counts[sample_rate_code] = stats.rate_code_counts.get(sample_rate_code, 0) + 1
                 
+                # Track byte order and integrity settings from packet headers
+                if not hasattr(stats, 'header_info'):
+                    stats.header_info = {
+                        'is_little_endian': is_little_endian,
+                        'has_integrity_check': has_integrity_check,
+                        'packet_count': 0,
+                        'overload_count': 0,
+                        'error_count': 0
+                    }
+                
+                stats.header_info['packet_count'] += 1
+                if has_overload:
+                    stats.header_info['overload_count'] += 1
+                if has_error:
+                    stats.header_info['error_count'] += 1
+                
                 # Send data packet to writer queue
                 packet_data = {
                     'data': bytes(packet_buffer[:bytes_received]),
                     'timestamp': time.time(),
-                    'samples': samples_in_packet
+                    'samples': samples_in_packet,
+                    'is_little_endian': is_little_endian,
+                    'has_integrity_check': has_integrity_check,
+                    'has_overload': has_overload,
+                    'has_error': has_error
                 }
                 
                 try:
@@ -125,7 +152,8 @@ class ProcessStreamReceiver:
                         'bytes_received': stats.bytes_received,
                         'sequence_errors': stats.sequence_errors,
                         'receive_errors': stats.errors,
-                        'rate_code_counts': dict(stats.rate_code_counts) if hasattr(stats, 'rate_code_counts') else {}
+                        'rate_code_counts': dict(stats.rate_code_counts) if hasattr(stats, 'rate_code_counts') else {},
+                        'header_info': dict(stats.header_info) if hasattr(stats, 'header_info') else {}
                     }
                     try:
                         self.stats_queue.put_nowait(stats_summary)
@@ -152,6 +180,7 @@ class ProcessStreamReceiver:
             'sequence_errors': stats.sequence_errors,
             'receive_errors': stats.errors,
             'rate_code_counts': dict(stats.rate_code_counts) if hasattr(stats, 'rate_code_counts') else {},
+            'header_info': dict(stats.header_info) if hasattr(stats, 'header_info') else {},
             'final': True
         }
         try:
@@ -173,7 +202,8 @@ class ProcessBinaryFileWriter(threading.Thread):
     
     def __init__(self, filename: str, config: StreamConfig, data_queue: mp.Queue, stop_event: mp.Event,
                  actual_rate_hz: Optional[float] = None, rate_divider: Optional[int] = None, 
-                 max_rate_hz: Optional[float] = None):
+                 max_rate_hz: Optional[float] = None, detected_little_endian: Optional[bool] = None,
+                 detected_integrity_check: Optional[bool] = None):
         super().__init__(name="FileWriter")
         self.filename = filename
         self.config = config
@@ -190,6 +220,10 @@ class ProcessBinaryFileWriter(threading.Thread):
             self.config.rate_divider = rate_divider
         if max_rate_hz is not None:
             self.config.max_rate_hz = max_rate_hz
+        if detected_little_endian is not None:
+            self.config.detected_little_endian = detected_little_endian
+        if detected_integrity_check is not None:
+            self.config.detected_integrity_check = detected_integrity_check
         
     def run(self):
         """Main writer loop."""
@@ -250,6 +284,8 @@ class ProcessBinaryFileWriter(threading.Thread):
             'actual_rate_hz': getattr(self.config, 'actual_rate_hz', None),  # Will be set by caller
             'rate_divider': getattr(self.config, 'rate_divider', None),      # Will be set by caller
             'max_rate_hz': getattr(self.config, 'max_rate_hz', None),        # Will be set by caller
+            'detected_little_endian': getattr(self.config, 'detected_little_endian', None),  # From packet headers
+            'detected_integrity_check': getattr(self.config, 'detected_integrity_check', None),  # From packet headers
         }
         
         # Write header size (4 bytes) and header data
@@ -542,7 +578,9 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
             filename, config, data_queue, stop_event, 
             actual_rate_hz=actual_rate, 
             rate_divider=config_info['rate_divider'], 
-            max_rate_hz=config_info['max_rate_hz']
+            max_rate_hz=config_info['max_rate_hz'],
+            detected_little_endian=config_info['use_little_endian'],
+            detected_integrity_check=config_info['use_integrity_check']
         )
         writer_thread.start()
         logging.info("Started writer thread")
@@ -566,8 +604,13 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
             'bytes_received': 0,
             'sequence_errors': 0,
             'receive_errors': 0,
-            'rate_code_counts': {}
+            'rate_code_counts': {},
+            'header_info': {}
         }
+        
+        # Track detected header information
+        detected_little_endian = None
+        detected_integrity_check = None
         
         while True:
             elapsed = time.time() - start_time
@@ -592,6 +635,18 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
                         total_stats['sequence_errors'] = stats_update['sequence_errors']
                         total_stats['receive_errors'] = stats_update['receive_errors']
                         total_stats['rate_code_counts'] = stats_update['rate_code_counts']
+                        
+                        # Update header information if available
+                        if 'header_info' in stats_update:
+                            total_stats['header_info'] = stats_update['header_info']
+                            # Update detected values for writer
+                            if detected_little_endian is None and 'is_little_endian' in stats_update['header_info']:
+                                detected_little_endian = stats_update['header_info']['is_little_endian']
+                                detected_integrity_check = stats_update['header_info']['has_integrity_check']
+                                # Update writer with detected values
+                                if writer_thread and hasattr(writer_thread, 'config'):
+                                    writer_thread.config.detected_little_endian = detected_little_endian
+                                    writer_thread.config.detected_integrity_check = detected_integrity_check
             except queue.Empty:
                 pass
             
@@ -713,6 +768,26 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
         logging.info("\nErrors:")
         logging.info(f"  Receive errors:  {total_stats['receive_errors']}")
         logging.info(f"  Sequence errors: {total_stats['sequence_errors']}")
+        
+        # Header information analysis
+        if 'header_info' in total_stats and total_stats['header_info']:
+            header_info = total_stats['header_info']
+            logging.info("\nPacket Header Analysis:")
+            logging.info(f"  Byte order:      {'Little-endian' if header_info.get('is_little_endian', False) else 'Big-endian'}")
+            logging.info(f"  Integrity check: {'Enabled' if header_info.get('has_integrity_check', False) else 'Disabled'}")
+            logging.info(f"  Overload events: {header_info.get('overload_count', 0):,}")
+            logging.info(f"  Error events:    {header_info.get('error_count', 0):,}")
+            
+            # Compare with configuration
+            config_little_endian = config_info['use_little_endian']
+            config_integrity = config_info['use_integrity_check']
+            detected_little_endian = header_info.get('is_little_endian', False)
+            detected_integrity = header_info.get('has_integrity_check', False)
+            
+            if config_little_endian != detected_little_endian:
+                logging.info(f"  ⚠️  Byte order mismatch: configured {'little' if config_little_endian else 'big'}, detected {'little' if detected_little_endian else 'big'}")
+            if config_integrity != detected_integrity:
+                logging.info(f"  ⚠️  Integrity check mismatch: configured {'enabled' if config_integrity else 'disabled'}, detected {'enabled' if detected_integrity else 'disabled'}")
         
         # Rate stability analysis
         if 'rate_code_counts' in total_stats and total_stats['rate_code_counts']:

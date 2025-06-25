@@ -112,6 +112,12 @@ class SR860BinaryReader:
             info['rate_source'] = 'header'
         else:
             info['rate_source'] = 'estimated'
+        
+        # Add detected header information if available
+        if 'detected_little_endian' in self.header and self.header['detected_little_endian'] is not None:
+            info['detected_byte_order'] = 'little-endian' if self.header['detected_little_endian'] else 'big-endian'
+        if 'detected_integrity_check' in self.header and self.header['detected_integrity_check'] is not None:
+            info['detected_integrity_check'] = 'enabled' if self.header['detected_integrity_check'] else 'disabled'
             
         return info
         
@@ -134,8 +140,18 @@ class SR860BinaryReader:
         else:
             dtype = np.int16
             
-        # Get byte order from header if available, otherwise try to detect
-        byte_order = self.header.get('byte_order', '<')
+        # Get byte order - prioritize detected byte order from header, then fallback
+        byte_order = '<'  # Default to little-endian
+        if 'detected_little_endian' in self.header and self.header['detected_little_endian'] is not None:
+            # Use detected byte order from packet headers
+            byte_order = '<' if self.header['detected_little_endian'] else '>'
+            print(f"Using detected byte order: {'little-endian' if self.header['detected_little_endian'] else 'big-endian'}")
+        elif 'byte_order' in self.header:
+            # Use previously determined byte order
+            byte_order = self.header['byte_order']
+        else:
+            # Try to detect from header format
+            byte_order = self.header.get('byte_order', '<')
         
         bytes_per_sample = self.header['bytes_per_point'] * self.header['points_per_sample']
         
@@ -624,12 +640,12 @@ class SR860BinaryReader:
                 
         print(f"Forced byte order: {byte_order}, format: {force_format or 'from header'}")
         
-    def plot_xy_data(self, n_samples: int = 10000, start_sample: int = 0,
+    def plot_xy_data(self, n_samples: Optional[int] = None, start_sample: int = 0,
                      plot_type: str = 'both'):
         """Plot X-Y data in various representations.
         
         Args:
-            n_samples: Number of samples to plot
+            n_samples: Number of samples to plot (None = all data)
             start_sample: Starting sample index
             plot_type: 'parametric', 'polar', or 'both'
         """
@@ -640,6 +656,11 @@ class SR860BinaryReader:
         if 'X' not in self.header['channel_names'] or 'Y' not in self.header['channel_names']:
             print("Error: X and Y channels not found in data")
             return None
+        
+        # If n_samples is None, plot all data
+        if n_samples is None:
+            info = self.get_info()
+            n_samples = info['n_samples'] - start_sample
             
         # Read data
         data = self.read_data(start_sample=start_sample, n_samples=n_samples)
@@ -661,6 +682,15 @@ class SR860BinaryReader:
         theta_data_rad = np.arctan2(y_plot, x_plot)
         theta_data_deg = np.degrees(theta_data_rad)
         
+        # Get actual sample rate for time axis
+        duration_info = self.estimate_experiment_duration()
+        if 'actual_sample_rate' in duration_info:
+            sample_rate = duration_info['actual_sample_rate']
+        else:
+            sample_rate = duration_info['estimated_sample_rate']
+        
+        time_seconds = np.arange(n_samples) / sample_rate
+        
         # Create appropriate plot(s)
         if plot_type == 'both':
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
@@ -672,8 +702,11 @@ class SR860BinaryReader:
         if plot_type in ['parametric', 'both']:
             ax = ax1 if plot_type == 'both' else ax1
             
+            # Subsample for better visualization if we have many points
+            subsample = max(1, len(x_plot) // 10000)  # Show max 10k points
+            
             # Plot trajectory with color gradient showing time evolution
-            points = ax.scatter(x_plot, y_plot, c=np.arange(len(x_plot)), 
+            points = ax.scatter(x_plot[::subsample], y_plot[::subsample], c=time_seconds[::subsample], 
                                cmap='viridis', alpha=0.6, s=1)
             
             # Mark start and end points
@@ -689,7 +722,7 @@ class SR860BinaryReader:
             
             # Add colorbar to show time progression
             if plot_type == 'both':
-                plt.colorbar(points, ax=ax, label='Sample Index')
+                plt.colorbar(points, ax=ax, label='Time (seconds)')
                 
         # Polar plot
         if plot_type in ['polar', 'both']:
@@ -703,9 +736,12 @@ class SR860BinaryReader:
                 # Convert to polar axes
                 ax.remove()
                 ax = fig.add_subplot(122, projection='polar')
+            
+            # Subsample for better visualization
+            subsample = max(1, len(r_data) // 10000)  # Show max 10k points
                 
             # Plot in polar coordinates
-            scatter = ax.scatter(theta_data_rad, r_data, c=np.arange(len(r_data)), 
+            scatter = ax.scatter(theta_data_rad[::subsample], r_data[::subsample], c=time_seconds[::subsample], 
                                 cmap='viridis', alpha=0.6, s=1)
             
             # Mark start and end
@@ -716,12 +752,12 @@ class SR860BinaryReader:
             ax.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
             
         plt.suptitle(f'SR860 X-Y Data Visualization - {Path(self.filename).name}\n'
-                    f'{n_samples} samples, Mean R: {np.mean(r_data):.3e}')
+                    f'Sample Rate: {sample_rate:,.0f} Hz, Duration: {time_seconds[-1]:.1f}s, Mean R: {np.mean(r_data):.3e}')
         plt.tight_layout()
         
         return fig
         
-    def plot_complex_analysis(self, n_samples: int = 10000, start_sample: int = 0):
+    def plot_complex_analysis(self, n_samples: Optional[int] = None, start_sample: int = 0):
         """Create comprehensive complex signal analysis plots."""
         if not self.header:
             self.read_header()
@@ -730,6 +766,11 @@ class SR860BinaryReader:
         if 'X' not in self.header['channel_names'] or 'Y' not in self.header['channel_names']:
             print("Error: X and Y channels not found in data")
             return None
+        
+        # If n_samples is None, plot all data
+        if n_samples is None:
+            info = self.get_info()
+            n_samples = info['n_samples'] - start_sample
             
         # Read data
         data = self.read_data(start_sample=start_sample, n_samples=n_samples)
@@ -751,18 +792,24 @@ class SR860BinaryReader:
         theta_data_rad = np.arctan2(y_plot, x_plot)
         theta_data_deg = np.degrees(theta_data_rad)
         
-        # Create time axis
-        estimated_rate = self.estimate_experiment_duration()['estimated_sample_rate']
-        time_ms = np.arange(n_samples) * 1000.0 / estimated_rate
+        # Get actual sample rate and create proper time axis
+        duration_info = self.estimate_experiment_duration()
+        if 'actual_sample_rate' in duration_info:
+            sample_rate = duration_info['actual_sample_rate']
+        else:
+            sample_rate = duration_info['estimated_sample_rate']
+        
+        # Create time axis in seconds
+        time_seconds = np.arange(n_samples) / sample_rate
         
         # Create figure with subplots
         fig = plt.figure(figsize=(15, 10))
         
         # 1. X and Y time series
         ax1 = plt.subplot(3, 2, 1)
-        ax1.plot(time_ms, x_plot, 'b-', linewidth=0.5, label='X (Real)')
-        ax1.plot(time_ms, y_plot, 'r-', linewidth=0.5, label='Y (Imaginary)')
-        ax1.set_xlabel('Time (ms)')
+        ax1.plot(time_seconds, x_plot, 'b-', linewidth=0.5, label='X (Real)')
+        ax1.plot(time_seconds, y_plot, 'r-', linewidth=0.5, label='Y (Imaginary)')
+        ax1.set_xlabel('Time (seconds)')
         ax1.set_ylabel('Amplitude')
         ax1.set_title('X and Y Components')
         ax1.grid(True, alpha=0.3)
@@ -770,16 +817,16 @@ class SR860BinaryReader:
         
         # 2. R (magnitude) time series
         ax2 = plt.subplot(3, 2, 2)
-        ax2.plot(time_ms, r_data, 'g-', linewidth=0.5)
-        ax2.set_xlabel('Time (ms)')
+        ax2.plot(time_seconds, r_data, 'g-', linewidth=0.5)
+        ax2.set_xlabel('Time (seconds)')
         ax2.set_ylabel('R (Magnitude)')
         ax2.set_title(f'Magnitude: Mean={np.mean(r_data):.3e}, Std={np.std(r_data):.3e}')
         ax2.grid(True, alpha=0.3)
         
         # 3. Theta (phase) time series
         ax3 = plt.subplot(3, 2, 3)
-        ax3.plot(time_ms, theta_data_deg, 'purple', linewidth=0.5)
-        ax3.set_xlabel('Time (ms)')
+        ax3.plot(time_seconds, theta_data_deg, 'purple', linewidth=0.5)
+        ax3.set_xlabel('Time (seconds)')
         ax3.set_ylabel('θ (degrees)')
         ax3.set_title('Phase Angle')
         ax3.grid(True, alpha=0.3)
@@ -787,14 +834,16 @@ class SR860BinaryReader:
         
         # 4. X-Y parametric plot
         ax4 = plt.subplot(3, 2, 4)
-        scatter = ax4.scatter(x_plot[::10], y_plot[::10], c=time_ms[::10], 
+        # Subsample for better visualization if we have many points
+        subsample = max(1, len(x_plot) // 10000)  # Show max 10k points
+        scatter = ax4.scatter(x_plot[::subsample], y_plot[::subsample], c=time_seconds[::subsample], 
                              cmap='viridis', alpha=0.5, s=1)
         ax4.set_xlabel('X (Real)')
         ax4.set_ylabel('Y (Imaginary)')
         ax4.set_title('X-Y Parametric Plot')
         ax4.grid(True, alpha=0.3)
         ax4.axis('equal')
-        plt.colorbar(scatter, ax=ax4, label='Time (ms)')
+        plt.colorbar(scatter, ax=ax4, label='Time (seconds)')
         
         # 5. Histogram of R values
         ax5 = plt.subplot(3, 2, 5)
@@ -832,7 +881,8 @@ class SR860BinaryReader:
         ax6.grid(True, alpha=0.3)
         ax6.set_xlim(-180, 180)
         
-        plt.suptitle(f'SR860 Complex Signal Analysis - {Path(self.filename).name}')
+        plt.suptitle(f'SR860 Complex Signal Analysis - {Path(self.filename).name}\n'
+                    f'Sample Rate: {sample_rate:,.0f} Hz, Duration: {time_seconds[-1]:.1f}s')
         plt.tight_layout()
         
         return fig
@@ -983,7 +1033,7 @@ class SR860BinaryReader:
             
             # Complex analysis plots
             try:
-                fig5 = self.plot_complex_analysis(n_samples=min(10000, info['n_samples']))
+                fig5 = self.plot_complex_analysis()
                 if fig5:
                     fig5.savefig(output_dir / f"{base_filename}_complex_analysis.png", dpi=150, bbox_inches='tight')
                     plt.close(fig5)
@@ -1082,11 +1132,11 @@ def analyze_file(filename: str, plot: bool = True, sample_rate: Optional[float] 
         # Sampling analysis plot (limited to first 10k samples for performance)
         reader.plot_sampling_analysis(n_samples=min(10000, info['n_samples']))
         
-        # X-Y plots if available (limited to first 10k samples for performance)
+        # X-Y plots if available (show full experiment duration)
         if 'X' in reader.header['channel_names'] and 'Y' in reader.header['channel_names']:
             print("\nGenerating X-Y plots...")
-            reader.plot_xy_data(n_samples=min(10000, info['n_samples']))
-            reader.plot_complex_analysis(n_samples=min(10000, info['n_samples']))
+            reader.plot_xy_data()  # Show full experiment duration
+            reader.plot_complex_analysis()  # Show full experiment duration
         
         plt.show()
 
