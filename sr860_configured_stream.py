@@ -171,7 +171,9 @@ def receiver_process_entry(config: StreamConfig, data_queue: mp.Queue, stats_que
 class ProcessBinaryFileWriter(threading.Thread):
     """Writer thread that gets data from the receiver process queue."""
     
-    def __init__(self, filename: str, config: StreamConfig, data_queue: mp.Queue, stop_event: mp.Event):
+    def __init__(self, filename: str, config: StreamConfig, data_queue: mp.Queue, stop_event: mp.Event,
+                 actual_rate_hz: Optional[float] = None, rate_divider: Optional[int] = None, 
+                 max_rate_hz: Optional[float] = None):
         super().__init__(name="FileWriter")
         self.filename = filename
         self.config = config
@@ -180,6 +182,14 @@ class ProcessBinaryFileWriter(threading.Thread):
         self.samples_written = 0
         self.bytes_written = 0
         self.file = None
+        
+        # Store rate information in config object for header writing
+        if actual_rate_hz is not None:
+            self.config.actual_rate_hz = actual_rate_hz
+        if rate_divider is not None:
+            self.config.rate_divider = rate_divider
+        if max_rate_hz is not None:
+            self.config.max_rate_hz = max_rate_hz
         
     def run(self):
         """Main writer loop."""
@@ -233,6 +243,13 @@ class ProcessBinaryFileWriter(threading.Thread):
             'format': self.config.format.value,
             'points_per_sample': self.config.points_per_sample,
             'bytes_per_point': self.config.bytes_per_point,
+            'packet_size': self.config.packet_size.value,
+            'port': self.config.port,
+            'use_little_endian': self.config.use_little_endian,
+            'use_integrity_check': self.config.use_integrity_check,
+            'actual_rate_hz': getattr(self.config, 'actual_rate_hz', None),  # Will be set by caller
+            'rate_divider': getattr(self.config, 'rate_divider', None),      # Will be set by caller
+            'max_rate_hz': getattr(self.config, 'max_rate_hz', None),        # Will be set by caller
         }
         
         # Write header size (4 bytes) and header data
@@ -521,7 +538,12 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
         logging.info(f"Started receiver process (PID: {receiver_process.pid})")
         
         # Start writer thread
-        writer_thread = ProcessBinaryFileWriter(filename, config, data_queue, stop_event)
+        writer_thread = ProcessBinaryFileWriter(
+            filename, config, data_queue, stop_event, 
+            actual_rate_hz=actual_rate, 
+            rate_divider=config_info['rate_divider'], 
+            max_rate_hz=config_info['max_rate_hz']
+        )
         writer_thread.start()
         logging.info("Started writer thread")
         
