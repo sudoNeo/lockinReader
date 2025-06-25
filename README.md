@@ -1,24 +1,20 @@
 # SR860 Lock-in Amplifier Streaming System
 
+## Quick Start
+
+After configuring your SR860 lock-in amplifier, use this script to stream data:
+
+```bash
+python sr860_configured_stream.py --ip 192.168.1.156 --duration 30
+```
+
+This will stream data for 30 seconds using your SR860's current configuration and save it to a binary file.
+
 ## Overview
 
-This system provides high-performance streaming capabilities for the Stanford Research Systems SR860 lock-in amplifier. It includes multiple streaming scripts optimized for different use cases, with comprehensive data analysis tools.
+This system provides high-performance streaming capabilities for the Stanford Research Systems SR860 lock-in amplifier. The `sr860_configured_stream.py` script is designed to be the primary tool for data collection after you've configured your lock-in amplifier settings.
 
-## Scripts Overview
-
-### 1. `sr860_configured_stream.py` - Recommended for Most Users
-Streams data at the SR860's current configuration without forcing optimization. Respects the instrument's settings and provides detailed performance analysis.
-
-### 2. `sr860_optimal_stream.py` - Advanced Users
-Automatically determines the optimal streaming rate based on system capabilities and SR860 constraints.
-
-### 3. `sr860_max_stream.py` - Maximum Performance
-Attempts maximum rate streaming with optional throttling to prevent packet loss.
-
-### 4. `sr860_binary_reader.py` - Data Analysis
-Comprehensive analysis tool for binary files created by the streaming scripts.
-
-## sr860_configured_stream.py - Detailed Guide
+## Main Script: `sr860_configured_stream.py`
 
 ### What It Does
 
@@ -29,64 +25,41 @@ The `sr860_configured_stream.py` script connects to an SR860 lock-in amplifier a
 - **Binary Output**: Saves data efficiently in binary format
 - **Performance Analysis**: Detects packet loss vs. rate inconsistency
 - **Organized Output**: Saves files to a `data/` folder
+- **Enhanced Rate Tracking**: Monitors actual sample rates from packet headers
+- **Header Analysis**: Detects byte order and integrity settings from packets
 
-### Architecture: Process-Based Design
+### Key Features
 
-```mermaid
-flowchart LR
-  main["Main Process"]
-  receiver1["Receiver Process<br/>(Equipment IP1)"]
-  writer["Writer Process"]
-  stats_queue1[[Stats Queue&nbsp;1]]
-  data_queue[[Data Queue]]
-  stop_event([Stop Event])
+- **Process-Based Architecture**: Uses multiprocessing for reliable data collection
+- **Enhanced Statistics**: Tracks detailed loss events, timing, and rate variations
+- **Automatic Byte Order Detection**: Detects and uses correct byte order from packet headers
+- **Comprehensive Performance Diagnosis**: Distinguishes between packet loss and SR860 rate variations
+- **File Header Metadata**: Saves actual rates and detected settings for accurate analysis
 
-  main -->|start| receiver1
-  main -->|start| writer
-  main -->|set| stop_event
+## Basic Usage
 
-  receiver1 -->|stats| stats_queue1
-  stats_queue1 --> main
-
-  receiver1 -->|data| data_queue
-  data_queue --> writer
-
-  receiver1 -.->|check| stop_event
-
-
-```
-The script uses **multiprocessing** (not threading) for the receiver to provide:
-
-1. **Better Isolation**: Each equipment gets its own process for data collection
-2. **Scalability**: Easy to extend to multiple pieces of equipment
-3. **Fault Tolerance**: Process crashes don't affect other equipment
-4. **Resource Management**: Better CPU utilization on multi-core systems
-
-**Process Architecture:**
-```
-Main Process
-├── SR860 Controller (VISA communication)
-├── Receiver Process (UDP packet processing)
-│   ├── Stats Queue → Main Process
-│   └── Data Queue → Writer Thread
-└── File Writer Thread (buffered binary output)
-```
-
-**Inter-Process Communication:**
-- **Stats Queue**: Receiver process sends statistics updates to main process
-- **Data Queue**: Receiver process sends raw data packets to writer thread
-- **Stop Event**: Main process signals receiver to shutdown
-
-This architecture allows each SR860 (or other equipment) to have its own dedicated receiver process, making it easy to scale to multiple instruments.
-
-### Command Line Options
-
-#### Basic Usage
+### Simple Streaming (Recommended)
 ```bash
-python sr860_configured_stream.py --ip 192.168.1.156 --duration 10
+python sr860_configured_stream.py --ip 192.168.1.156 --duration 30
 ```
+Streams for 30 seconds using your SR860's current configuration.
 
-#### Connection Options
+### Set Time Constant Before Streaming
+```bash
+python sr860_configured_stream.py --ip 192.168.1.156 --duration 60 --time-constant 9
+```
+Sets time constant to 1ms (index 9) before streaming for 60 seconds.
+
+### Override Specific Settings
+```bash
+python sr860_configured_stream.py --ip 192.168.1.156 --duration 10 \
+    --channel X --format int16 --time-constant 0
+```
+Maximum speed streaming with X channel only, int16 format, and fastest time constant.
+
+## Command Line Options
+
+### Connection Options
 - `--ip IP_ADDRESS` (default: 192.168.1.156)
   - SR860 IP address on the network
 
@@ -94,7 +67,7 @@ python sr860_configured_stream.py --ip 192.168.1.156 --duration 10
   - Streaming duration in seconds
   - Use 0 for indefinite streaming (Ctrl+C to stop)
 
-#### Configuration Override Options
+### Configuration Override Options
 By default, the script uses the SR860's current configuration. These options allow you to override specific settings:
 
 - `--channel {X,XY,RT,XYRT}` (default: use current)
@@ -124,7 +97,7 @@ By default, the script uses the SR860's current configuration. These options all
 - `--no-integrity` (default: use current)
   - Disable integrity checking (faster but less reliable)
 
-#### Time Constant Control
+### Time Constant Control
 - `--time-constant INDEX` (0-21)
   - Sets the SR860's time constant before streaming
   - **Lower values = faster response = higher max rate**
@@ -132,77 +105,106 @@ By default, the script uses the SR860's current configuration. These options all
   - **9**: 1ms (max 78kHz)
   - **21**: 300s (max 1.22Hz)
 
-#### Mode Selection
+### Mode Selection
 - `--use-current`
   - Force use of current SR860 configuration (ignore other options)
 
-### Usage Examples
+## Architecture: Process-Based Design
+```mermaid flowchart TD
+    A[Start] --> B[Parse Command-Line Arguments]
+    B --> C{Connect to SR860?}
+    C -- Yes --> D[Optionally Set Time Constant]
+    C -- No --> Z[Abort]
+    D --> E{Use Current Config?}
+    E -- Yes --> F[Read Current Configuration]
+    E -- No --> G[Apply New Configuration]
+    F --> H[Prepare Filename & Queues]
+    G --> H
+    H --> I[Spawn Receiver Process]
+    I --> J[Start Writer Thread]
+    J --> K[Start Streaming on SR860]
+    K --> L[Monitor Stats Loop]
+    L --> M{Duration Reached or SIGINT?}
+    M -- No --> L
+    M -- Yes --> N[Signal stop_event]
+    N --> O[Stop Streaming on SR860]
+    O --> P[Join Receiver & Writer]
+    P --> Q[Collect Final Stats]
+    Q --> R[Log Final Report]
+    R --> S[End]
 
-#### 1. Basic Streaming (Current Configuration)
-```bash
-python sr860_configured_stream.py --ip 192.168.1.156 --duration 30
+
+````
+The script uses **multiprocessing** for reliable data collection:
+```mermaid 
+flowchart LR
+    subgraph MainProcess
+        A[SR860ConfiguredController]
+        B[receiver_process<br/> ProcessStreamReceiver ]
+        C[writer_thread<br/> ProcessBinaryFileWriter ]
+    end
+
+    %% Communication channels
+    B -->|put packet_data| D((data_queue))
+    D -->|get packet_data| C
+
+    B -->|put stats_summary| E((stats_queue))
+    E -->|get stats_summary| A
+
+    %% Shutdown event
+    A -->|signal SIGINT → set| F[[stop_event]]
+    B -.->|checks| F
+    C -.->|checks| F
 ```
-Streams for 30 seconds using whatever the SR860 is currently configured for.
 
-#### 2. High-Speed Single Channel
-```bash
-python sr860_configured_stream.py --ip 192.168.1.156 --duration 10 \
-    --channel X --format int16 --time-constant 0
 ```
-Maximum speed streaming with X channel only, int16 format, and fastest time constant.
-
-#### 3. High-Precision Multi-Channel
-```bash
-python sr860_configured_stream.py --ip 192.168.1.156 --duration 60 \
-    --channel XYRT --format float32 --time-constant 9
+Main Process
+├── SR860 Controller (VISA communication)
+├── Receiver Process (UDP packet processing)
+│   ├── Stats Queue → Main Process
+│   └── Data Queue → Writer Thread
+└── File Writer Thread (buffered binary output)
 ```
-All channels with full precision, 1ms time constant for stable measurements.
 
-#### 4. Custom Rate
-```bash
-python sr860_configured_stream.py --ip 192.168.1.156 --duration 20 \
-    --rate-divider 3
-```
-Streams at 1/8th of the maximum rate (useful for slower signals).
+**Benefits:**
+- **Better Isolation**: Each equipment gets its own process
+- **Scalability**: Easy to extend to multiple pieces of equipment
+- **Fault Tolerance**: Process crashes don't affect other equipment
+- **Resource Management**: Better CPU utilization on multi-core systems
 
-#### 5. Indefinite Streaming
-```bash
-python sr860_configured_stream.py --ip 192.168.1.156 --duration 0
-```
-Streams until you press Ctrl+C.
+## Data Collection Process
 
-### Data Collection Process
-
-#### 1. Connection Phase
+### 1. Connection Phase
 - Establishes VISA connection to SR860
 - Reads current configuration
 - Optionally sets time constant
 - Optionally applies new configuration
 
-#### 2. Streaming Setup
+### 2. Streaming Setup
 - Creates binary file in `data/` folder
-- Starts UDP receiver thread
+- Starts UDP receiver process
 - Configures SR860 to begin streaming
 
-#### 3. Data Collection
+### 3. Data Collection
 - **Main Thread**: Monitors progress and displays statistics
-- **Receiver Thread**: Continuously receives UDP packets
+- **Receiver Process**: Continuously receives UDP packets
 - **File Writer**: Buffers and writes data to disk
 
-#### 4. Packet Processing
+### 4. Packet Processing
 Each UDP packet contains:
-- 4-byte header (counter, content type, length, rate code, status)
+- 4-byte header (counter, rate code, status bits)
 - Raw data (X, Y, R, Theta values)
 - Only raw data is saved to file (headers are stripped)
 
-#### 5. Real-time Analysis
+### 5. Real-time Analysis
 - Packet sequence monitoring (detects lost packets)
 - Rate consistency analysis (SR860 may adjust rate)
 - Performance metrics calculation
+- Header bit analysis (byte order, integrity checking)
 
-### Output Files
+## Output Files
 
-#### Binary File Format
+### Binary File Format
 Files are saved as `data/sr860_configured_IP_TIMESTAMP.bin`
 
 **File Structure:**
@@ -212,7 +214,7 @@ Files are saved as `data/sr860_configured_IP_TIMESTAMP.bin`
 [Data]    Raw binary data (no packet headers)
 ```
 
-**Header Metadata:**
+**Enhanced Header Metadata:**
 ```json
 {
   "version": 1,
@@ -220,36 +222,77 @@ Files are saved as `data/sr860_configured_IP_TIMESTAMP.bin`
   "channel": 3,
   "format": 1,
   "points_per_sample": 4,
-  "bytes_per_point": 2
+  "bytes_per_point": 2,
+  "actual_rate_hz": 78125.0,
+  "rate_divider": 4,
+  "max_rate_hz": 1250000.0,
+  "detected_little_endian": true,
+  "detected_integrity_check": false
 }
 ```
 
-#### Performance Statistics
+### Performance Statistics
 The script provides comprehensive statistics including:
 - Sample rate efficiency
 - Packet loss detection
 - Data rate (Mbps)
-- Timing analysis (latency, jitter)
 - SR860 rate variation analysis
+- Header bit analysis (byte order, integrity checking)
+- Performance diagnosis and recommendations
 
-### Performance Characteristics
+## Performance Characteristics
 
-#### Typical Performance
+### Typical Performance
 - **No Packet Loss**: 0 sequence errors
 - **Efficiency**: 80-95% (SR860 may adjust rate)
 - **Data Rate**: 1-160 Mbps depending on configuration
 - **Latency**: <1ms typical packet intervals
 
-#### Rate vs. Time Constant
+### Rate vs. Time Constant
 | Time Constant | Max Rate | Typical Use |
 |---------------|----------|-------------|
 | 1μs (0)       | 1.25MHz  | High-speed transients |
 | 1ms (9)       | 78kHz    | Standard measurements |
 | 300s (21)     | 1.22Hz   | Very slow processes |
 
-### Troubleshooting
+## Data Analysis
 
-#### Common Issues
+After streaming, use `sr860_binary_reader.py` for comprehensive analysis:
+
+### Basic Analysis
+```bash
+python sr860_binary_reader.py data/sr860_configured_192_168_1_156_20250624_163541.bin
+```
+
+### Save All Plots
+```bash
+python sr860_binary_reader.py data/sr860_configured_192_168_1_156_20250624_163541.bin --save-plots
+```
+
+### Export to CSV
+```bash
+python sr860_binary_reader.py data/sr860_configured_192_168_1_156_20250624_163541.bin --export-csv my_data.csv
+```
+
+### Complex Analysis (X-Y Data)
+```bash
+python sr860_binary_reader.py data/sr860_configured_192_168_1_156_20250624_163541.bin --xy-plot both
+```
+
+## Other Scripts
+
+### `sr860_optimal_stream.py` - Advanced Users
+Automatically determines the optimal streaming rate based on system capabilities and SR860 constraints.
+
+### `sr860_max_stream.py` - Maximum Performance
+Attempts maximum rate streaming with optional throttling to prevent packet loss.
+
+### `sr860_binary_reader.py` - Data Analysis
+Comprehensive analysis tool for binary files created by the streaming scripts.
+
+## Troubleshooting
+
+### Common Issues
 
 1. **Connection Failed**
    - Check IP address and network connectivity
@@ -270,7 +313,7 @@ The script provides comprehensive statistics including:
    - SR860 rate variation is normal
    - Only sequence errors indicate real problems
 
-#### Performance Optimization
+### Performance Optimization
 
 1. **For Maximum Speed**
    - Use single channel (`--channel X`)
@@ -287,22 +330,7 @@ The script provides comprehensive statistics including:
    - Monitor efficiency vs. packet loss
    - Adjust rate divider if needed
 
-### Integration with Analysis Tools
-
-After streaming, use `sr860_binary_reader.py` for analysis:
-
-```bash
-# Basic analysis
-python sr860_binary_reader.py data/sr860_configured_192_168_1_156_20250624_163541.bin
-
-# Save plots
-python sr860_binary_reader.py data/sr860_configured_192_168_1_156_20250624_163541.bin --save-plots
-
-# Export to CSV
-python sr860_binary_reader.py data/sr860_configured_192_168_1_156_20250624_163541.bin --export-csv my_data.csv
-```
-
-### File Organization
+## File Organization
 
 The system creates organized folder structure:
 ```
@@ -315,15 +343,17 @@ TowardWorking/
 │   ├── *_time_series.png
 │   ├── *_spectrum.png
 │   ├── *_sampling_analysis.png
+│   ├── *_xy_plots.png
+│   ├── *_complex_analysis.png
 │   └── *.csv
 └── scripts/
-    ├── sr860_configured_stream.py
+    ├── sr860_configured_stream.py  # Main streaming script
     ├── sr860_optimal_stream.py
     ├── sr860_max_stream.py
     └── sr860_binary_reader.py
 ```
 
-### System Requirements
+## System Requirements
 
 - Python 3.7+
 - PyVISA for instrument communication
@@ -332,13 +362,50 @@ TowardWorking/
 - Network connection to SR860
 - Sufficient disk space for data files
 
-### Dependencies
+## Dependencies
 
 ```bash
 pip install pyvisa numpy matplotlib
 ```
+## Process per instrument (next iteration) 
+```mermaid flowchart LR
+    subgraph MainProcess
+      A[Parse Args & Build Configs]
+      B[For each instrument]
+      C[Connect + Optionally Set TC]
+    end
 
-### Support
+    B --> D1[Device 1 Config]
+    B --> D2[Device 2 Config]
+
+    D1 --> E1[Queue₁ & Event₁]
+    D2 --> E2[Queue₂ & Event₂]
+
+    E1 --> F1[Receiver Proc₁]
+    E2 --> F2[Receiver Proc₂]
+
+    F1 -->|data₁| G1((data_q₁)) --> H1[Writer Thread₁]
+    F2 -->|data₂| G2((data_q₂)) --> H2[Writer Thread₂]
+
+    F1 -->|stats₁| I1((stats_q₁)) --> J[Stats Collector]
+    F2 -->|stats₂| I2((stats_q₂)) --> J
+
+    J --> K[Aggregate & Log Dashboard]
+
+    A --> B --> C
+    C --> F1
+    C --> F2
+
+    %% Shutdown
+    K --> L{Shutdown?}
+    L -->|yes| M1[set Event₁]
+    L -->|yes| M2[set Event₂]
+    M1 --> N1[Join Proc₁ & Thread₁]
+    M2 --> N2[Join Proc₂ & Thread₂]
+    N1 --> O[End]
+    N2 --> O
+```
+## Support
 
 For issues or questions:
 1. Check the troubleshooting section above
