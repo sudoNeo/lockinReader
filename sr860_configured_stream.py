@@ -25,6 +25,9 @@ import pyvisa
 from sr860_optimal_stream import *
 from sr860_max_stream import StreamReceiver, BinaryFileWriter
 
+# Import binary reader for automatic analysis
+from sr860_binary_reader import SR860BinaryReader
+
 logging.basicConfig(
     format="%(levelname)-8s [%(processName)-12s:%(threadName)-10s] %(asctime)s | %(message)s",
     datefmt="%H:%M:%S.%f",
@@ -129,7 +132,7 @@ class ProcessStreamReceiver:
                 # Send data packet to writer queue
                 packet_data = {
                     'data': bytes(packet_buffer[:bytes_received]),
-                    'timestamp': time.time(),
+                    'timestamp': time.time_ns(),
                     'samples': samples_in_packet,
                     'is_little_endian': is_little_endian,
                     'has_integrity_check': has_integrity_check,
@@ -495,10 +498,14 @@ class SR860ConfiguredController:
 
 def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None, 
                                rate_divider: Optional[int] = None, duration: float = 10.0,
-                               use_current_config: bool = True, time_constant: Optional[int] = None):
+                               use_current_config: bool = True, time_constant: Optional[int] = None,
+                               auto_analysis: bool = True):
     """Worker function for streaming at configured rate using process-based architecture."""
     
     logging.info(f"Process-based streaming worker started for {ip}")
+    
+    # Initialize start_time early to avoid UnboundLocalError
+    start_time = time.time()
     
     # Create controller
     controller = SR860ConfiguredController(ip)
@@ -851,6 +858,54 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
             logging.info("   • Use STREAMRATEMAX? to check maximum allowed rate")
             logging.info("   • Adjust STREAMRATE n to reduce rate if needed")
 
+        # Automatic analysis
+        if auto_analysis and filename and Path(filename).exists():
+            logging.info("\n" + "="*60)
+            logging.info("AUTOMATIC ANALYSIS")
+            logging.info("="*60)
+            logging.info("Opening plots for data analysis...")
+            
+            try:
+                # Create binary reader and perform analysis
+                reader = SR860BinaryReader(str(filename))
+                
+                # Get file info
+                info = reader.get_info()
+                logging.info(f"Analyzing file: {info['filename']}")
+                logging.info(f"Samples: {info['n_samples']:,}")
+                logging.info(f"Channels: {info['channel_config']}")
+                logging.info(f"Format: {info['data_format']}")
+                
+                # Display plots
+                import matplotlib.pyplot as plt
+                
+                # Time series plot
+                logging.info("Generating time series plot...")
+                fig1 = reader.plot_time_series()
+                
+                # Frequency spectrum if enough samples
+                if info['n_samples'] >= 1024:
+                    logging.info("Generating frequency spectrum...")
+                    fig2 = reader.plot_spectrum()
+                
+                # X-Y plots if available
+                if 'X' in info['channel_config'] and 'Y' in info['channel_config']:
+                    logging.info("Generating X-Y plots...")
+                    fig3 = reader.plot_xy_data()
+                
+                # Show all plots
+                logging.info("Displaying plots (close windows to continue)...")
+                plt.show()
+                
+                logging.info("Analysis complete!")
+                
+            except Exception as e:
+                logging.error(f"Automatic analysis failed: {e}")
+                import traceback
+                traceback.print_exc()
+        elif auto_analysis:
+            logging.warning("Auto-analysis requested but no valid output file found")
+
 
 def main():
     """Main application for configured rate SR860 streaming."""
@@ -890,6 +945,10 @@ def main():
     # Mode selection
     parser.add_argument("--use-current", action="store_true",
                         help="Force use of current SR860 configuration (ignore other options)")
+    
+    # Automatic analysis option
+    parser.add_argument("--no-auto-analysis", action="store_true",
+                        help="Disable automatic analysis and plotting after streaming")
     
     args = parser.parse_args()
     
@@ -944,7 +1003,8 @@ def main():
             rate_divider=args.rate_divider,
             duration=args.duration,
             use_current_config=use_current,
-            time_constant=args.time_constant
+            time_constant=args.time_constant,
+            auto_analysis=not args.no_auto_analysis
         )
     except KeyboardInterrupt:
         logging.info("Streaming stopped by user")

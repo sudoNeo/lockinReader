@@ -110,7 +110,8 @@ By default, the script uses the SR860's current configuration. These options all
   - Force use of current SR860 configuration (ignore other options)
 
 ## Architecture: Process-Based Design
-```mermaid flowchart TD
+```mermaid 
+flowchart TD
     A[Start] --> B[Parse Command-Line Arguments]
     B --> C{Connect to SR860?}
     C -- Yes --> D[Optionally Set Time Constant]
@@ -368,7 +369,8 @@ TowardWorking/
 pip install pyvisa numpy matplotlib
 ```
 ## Process per instrument (next iteration) 
-```mermaid flowchart LR
+```mermaid 
+flowchart LR
     subgraph MainProcess
       A[Parse Args & Build Configs]
       B[For each instrument]
@@ -412,3 +414,94 @@ For issues or questions:
 2. Review the performance statistics output
 3. Verify SR860 manual for instrument-specific settings
 4. Check network connectivity and firewall settings 
+
+## Future Deliverables
+
+### Nanosecond-Accurate Packet Timestamping
+
+Below is the shortest path to **nanosecond-accurate, per-packet timestamps** on Linux together with the pitfalls that usually cause "hiccups" when you try to do it in Python.
+
+---
+
+## 1 · Ask the kernel for the timestamp **once, during `recvmsg()`**
+
+```python
+import socket, struct, gc, array
+
+UDP_IP   = "0.0.0.0"
+UDP_PORT = 5555
+PKT_SIZE = 2048                      # big enough for your largest datagram
+CMSG_SZ  = socket.CMSG_SPACE(16)     # space for one struct timespec
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+
+# 1) Big ring-buffer in the kernel so you never back-pressure the NIC
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+
+# 2) One-line nanosecond software timestamping (supported on every kernel)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_TIMESTAMPNS, 1)
+# If the NIC/driver supports PTP you can switch to the richer API:
+#   flags = (socket.SOF_TIMESTAMPING_RX_HARDWARE |
+#            socket.SOF_TIMESTAMPING_RAW_HARDWARE |
+#            socket.SOF_TIMESTAMPING_SOFTWARE)
+#   sock.setsockopt(socket.SOL_SOCKET, socket.SO_TIMESTAMPING, flags)
+
+sock.bind((UDP_IP, UDP_PORT))
+
+# Pre-allocate buffers to avoid per-packet mallocs
+data_buf  = bytearray(PKT_SIZE)
+anc_buf   = bytearray(CMSG_SZ)
+iov       = [memoryview(data_buf)]
+
+gc.disable()                         # optional: prevents GC pauses
+
+while True:
+    nbytes, ancdata, flags, addr = sock.recvmsg_into(iov, CMSG_SZ)
+    for level, ctype, cdata in ancdata:
+        if level == socket.SOL_SOCKET and ctype == socket.SCM_TIMESTAMPNS:
+            tv_sec, tv_nsec = struct.unpack("qq", cdata)
+            ts_ns = tv_sec * 1_000_000_000 + tv_nsec
+            # (data_buf[:nbytes] now holds the packet bytes)
+            process(ts_ns, data_buf[:nbytes])
+```
+
+*What you get*: a **kernel-generated timestamp in the same time base as `clock_gettime(CLOCK_REALTIME)`**, accurate to the nanosecond field of `struct timespec` (≈50 ns RMS on commodity PCs). The control-message path is documented in the kernel's timestamping guide ([docs.kernel.org][1]) and the option itself is `SO_TIMESTAMPNS` ([man7.org][2]).
+
+---
+
+## 2 · Can your Realtek do hardware stamps?
+
+Run
+
+```bash
+$ ethtool -T eth0
+```
+
+A Realtek RTL8111/8168 (rev 15) normally lists **only software modes**, so the code above is already the best you can do. Hardware timestamping appears only on newer RTL8125 parts and even there it's disabled in the in-tree r8169 driver unless you use a vendor fork ([serverfault.com][3]).
+
+If you truly need sub-microsecond accuracy you'll want an Intel I210/I225 or an AMD‐based Mellanox/Marvell card that advertises `SOF_TIMESTAMPING_RX_HARDWARE`.
+
+---
+
+## 3 · Why pauses still happen & how to shave them off
+
+| Layer              | Typical cause                                                | Mitigation                                                                     |
+| ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| **NIC ↔ kernel**   | Ring overflow bursts (drops rise in `/proc/net/dev`)         | `ethtool -C` to tune interrupt coalescing; enlarge receive ring (`ethtool -G`) |
+| **Kernel buffer**  | Auto-tuning grows SO\_RCVBUF too late, causing back-pressure | Pre-set a large buffer (`SO_RCVBUF` + `/proc/sys/net/core/rmem_max`)           |
+| **Syscall path**   | One syscall per packet                                       | Batch: use `recvmmsg()` (Python 3.11+) or AF\_PACKET/TPACKET\_V3 mmap rings    |
+| **Python runtime** | Allocations + garbage collection every few MB                | Re-use `bytearray`s, disable or retune `gc`, move parsing to Cython/NumPy      |
+| **Downstream I/O** | Frequent tiny writes (fsync) to disk                         | Queue in RAM, spill to disk in 1–4 MB blocks or use an async writer thread     |
+| **CPU scheduler**  | Other threads pre-empt the reader                            | `chrt -f 90 python …`, pin reader to an isolated core (`isolcpus=` kernel arg) |
+
+At 80 Mb/s you're seeing \~6–7 k UDP datagrams / s (assuming 1500-byte MTU). Even pure-Python can keep up provided you:
+
+1. **Receive → timestamp → enqueue** in one tight loop (no I/O).
+2. Hand data to a **separate process/thread** that does disk writes, plots, etc.
+3. Keep the NIC & kernel happy with generous buffers so nothing drops while Python is busy.
+
+Do those three and you'll get a steady nanosecond time-stamp for every packet with no periodic stalls.
+
+[1]: https://docs.kernel.org/networking/timestamping.html?utm_source=chatgpt.com "Timestamping - The Linux Kernel documentation"
+[2]: https://man7.org/linux/man-pages/man7/socket.7.html?utm_source=chatgpt.com "socket(7) - Linux manual page - man7.org"
+[3]: https://serverfault.com/questions/1078760/ptp-support-for-rtl8125b-cg-nic-in-ubuntu-20-04?utm_source=chatgpt.com "PTP support for RTL8125B-CG NIC in Ubuntu 20.04 - Server Fault" 

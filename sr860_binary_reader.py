@@ -10,6 +10,7 @@ import ast
 import struct
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib import animation
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 from datetime import datetime
@@ -405,7 +406,7 @@ class SR860BinaryReader:
         time_seconds = np.arange(n_samples) / sample_rate
         
         for i, (ax, name) in enumerate(zip(axes, self.header['channel_names'])):
-            ax.plot(time_seconds, data[:, i], linewidth=0.5)
+            ax.scatter(time_seconds, data[:, i], s =1)
             ax.set_ylabel(f'{name}\n({self._get_units(name)})')
             ax.grid(True, alpha=0.3)
             ax.set_xlim(time_seconds[0], time_seconds[-1])
@@ -641,14 +642,8 @@ class SR860BinaryReader:
         print(f"Forced byte order: {byte_order}, format: {force_format or 'from header'}")
         
     def plot_xy_data(self, n_samples: Optional[int] = None, start_sample: int = 0,
-                     plot_type: str = 'both'):
-        """Plot X-Y data in various representations.
-        
-        Args:
-            n_samples: Number of samples to plot (None = all data)
-            start_sample: Starting sample index
-            plot_type: 'parametric', 'polar', or 'both'
-        """
+                    plot_type: str = 'both'):
+        """Plot X-Y data in various representations without animation."""
         if not self.header:
             self.read_header()
             
@@ -693,72 +688,54 @@ class SR860BinaryReader:
         
         # Create appropriate plot(s)
         if plot_type == 'both':
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            fig = plt.figure(figsize=(15, 6))
+            ax1 = plt.subplot(1, 2, 1)
         else:
             fig, ax = plt.subplots(1, 1, figsize=(8, 8))
             ax1 = ax2 = ax
             
         # Parametric X-Y plot
         if plot_type in ['parametric', 'both']:
-            ax = ax1 if plot_type == 'both' else ax1
-            
-            # Subsample for better visualization if we have many points
-            subsample = max(1, len(x_plot) // 10000)  # Show max 10k points
-            
-            # Plot trajectory with color gradient showing time evolution
+            ax = ax1
+            subsample = max(1, len(x_plot) // 10000)
             points = ax.scatter(x_plot[::subsample], y_plot[::subsample], c=time_seconds[::subsample], 
-                               cmap='viridis', alpha=0.6, s=1)
-            
-            # Mark start and end points
+                                cmap='viridis', alpha=0.6, s=1)
             ax.plot(x_plot[0], y_plot[0], 'go', markersize=10, label='Start')
             ax.plot(x_plot[-1], y_plot[-1], 'ro', markersize=10, label='End')
-            
             ax.set_xlabel('X (Real)')
             ax.set_ylabel('Y (Imaginary)')
             ax.set_title('X-Y Parametric Plot (Complex Plane)')
             ax.grid(True, alpha=0.3)
             ax.axis('equal')
             ax.legend()
-            
-            # Add colorbar to show time progression
             if plot_type == 'both':
                 plt.colorbar(points, ax=ax, label='Time (seconds)')
-                
-        # Polar plot
+        
+        # Polar plot (static)
         if plot_type in ['polar', 'both']:
-            ax = ax2 if plot_type == 'both' else ax1
-            
-            # Create polar subplot
-            if plot_type != 'both':
-                plt.clf()
-                ax = plt.subplot(111, projection='polar')
+            if plot_type == 'both':
+                ax = fig.add_subplot(1, 2, 2, projection='polar')
             else:
-                # Convert to polar axes
-                ax.remove()
-                ax = fig.add_subplot(122, projection='polar')
+                ax = fig.add_subplot(1, 1, 1, projection='polar')
             
-            # Subsample for better visualization
-            subsample = max(1, len(r_data) // 10000)  # Show max 10k points
-                
-            # Plot in polar coordinates
-            scatter = ax.scatter(theta_data_rad[::subsample], r_data[::subsample], c=time_seconds[::subsample], 
-                                cmap='viridis', alpha=0.6, s=1)
-            
-            # Mark start and end
-            ax.plot(theta_data_rad[0], r_data[0], 'go', markersize=10, label='Start')
-            ax.plot(theta_data_rad[-1], r_data[-1], 'ro', markersize=10, label='End')
-            
-            ax.set_title('Polar Plot (R, θ)')
-            ax.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
-            
+            subsample = max(1, len(r_data) // 10000)
+            points = ax.scatter(theta_data_rad[::subsample], r_data[::subsample], 
+                                c=time_seconds[::subsample], cmap='viridis', alpha=0.6, s=1)
+            ax.plot(theta_data_rad[0], r_data[0], 'go', markersize=8, label='Start')
+            ax.plot(theta_data_rad[-1], r_data[-1], 'ro', markersize=8, label='End')
+            ax.set_title('Polar Plot')
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(0, np.max(r_data))
+            ax.legend()
+            plt.colorbar(points, ax=ax, label='Time (seconds)')
+        
         plt.suptitle(f'SR860 X-Y Data Visualization - {Path(self.filename).name}\n'
                     f'Sample Rate: {sample_rate:,.0f} Hz, Duration: {time_seconds[-1]:.1f}s, Mean R: {np.mean(r_data):.3e}')
         plt.tight_layout()
         
         return fig
-        
     def plot_complex_analysis(self, n_samples: Optional[int] = None, start_sample: int = 0):
-        """Create comprehensive complex signal analysis plots."""
+ 
         if not self.header:
             self.read_header()
             
@@ -799,14 +776,13 @@ class SR860BinaryReader:
         else:
             sample_rate = duration_info['estimated_sample_rate']
         
-        # Create time axis in seconds
         time_seconds = np.arange(n_samples) / sample_rate
         
-        # Create figure with subplots
-        fig = plt.figure(figsize=(15, 10))
+        # Create figure with four subplots in a 2x2 grid
+        fig = plt.figure(figsize=(12, 8))
         
         # 1. X and Y time series
-        ax1 = plt.subplot(3, 2, 1)
+        ax1 = plt.subplot(2, 2, 1)
         ax1.plot(time_seconds, x_plot, 'b-', linewidth=0.5, label='X (Real)')
         ax1.plot(time_seconds, y_plot, 'r-', linewidth=0.5, label='Y (Imaginary)')
         ax1.set_xlabel('Time (seconds)')
@@ -816,7 +792,7 @@ class SR860BinaryReader:
         ax1.legend()
         
         # 2. R (magnitude) time series
-        ax2 = plt.subplot(3, 2, 2)
+        ax2 = plt.subplot(2, 2, 2)
         ax2.plot(time_seconds, r_data, 'g-', linewidth=0.5)
         ax2.set_xlabel('Time (seconds)')
         ax2.set_ylabel('R (Magnitude)')
@@ -824,7 +800,7 @@ class SR860BinaryReader:
         ax2.grid(True, alpha=0.3)
         
         # 3. Theta (phase) time series
-        ax3 = plt.subplot(3, 2, 3)
+        ax3 = plt.subplot(2, 2, 3)
         ax3.plot(time_seconds, theta_data_deg, 'purple', linewidth=0.5)
         ax3.set_xlabel('Time (seconds)')
         ax3.set_ylabel('θ (degrees)')
@@ -833,11 +809,10 @@ class SR860BinaryReader:
         ax3.set_ylim(-180, 180)
         
         # 4. X-Y parametric plot
-        ax4 = plt.subplot(3, 2, 4)
-        # Subsample for better visualization if we have many points
-        subsample = max(1, len(x_plot) // 10000)  # Show max 10k points
+        ax4 = plt.subplot(2, 2, 4)
+        subsample = max(1, len(x_plot) // 10000)
         scatter = ax4.scatter(x_plot[::subsample], y_plot[::subsample], c=time_seconds[::subsample], 
-                             cmap='viridis', alpha=0.5, s=1)
+                            cmap='viridis', alpha=0.5, s=1)
         ax4.set_xlabel('X (Real)')
         ax4.set_ylabel('Y (Imaginary)')
         ax4.set_title('X-Y Parametric Plot')
@@ -845,47 +820,12 @@ class SR860BinaryReader:
         ax4.axis('equal')
         plt.colorbar(scatter, ax=ax4, label='Time (seconds)')
         
-        # 5. Histogram of R values
-        ax5 = plt.subplot(3, 2, 5)
-        try:
-            # Filter out extreme values for histogram
-            r_filtered = r_data[np.isfinite(r_data) & (r_data < max_plot_val)]
-            if len(r_filtered) > 0:
-                ax5.hist(r_filtered, bins=100, alpha=0.7, edgecolor='black')
-            else:
-                ax5.text(0.5, 0.5, 'No valid R values for histogram', 
-                        transform=ax5.transAxes, ha='center', va='center')
-        except Exception as e:
-            ax5.text(0.5, 0.5, f'Error plotting histogram: {str(e)}', 
-                    transform=ax5.transAxes, ha='center', va='center')
-        ax5.set_xlabel('R (Magnitude)')
-        ax5.set_ylabel('Count')
-        ax5.set_title('Magnitude Distribution')
-        ax5.grid(True, alpha=0.3)
-        
-        # 6. Histogram of Theta values
-        ax6 = plt.subplot(3, 2, 6)
-        try:
-            theta_filtered = theta_data_deg[np.isfinite(theta_data_deg)]
-            if len(theta_filtered) > 0:
-                ax6.hist(theta_filtered, bins=100, alpha=0.7, edgecolor='black', color='purple')
-            else:
-                ax6.text(0.5, 0.5, 'No valid Theta values for histogram', 
-                        transform=ax6.transAxes, ha='center', va='center')
-        except Exception as e:
-            ax6.text(0.5, 0.5, f'Error plotting histogram: {str(e)}', 
-                    transform=ax6.transAxes, ha='center', va='center')
-        ax6.set_xlabel('θ (degrees)')
-        ax6.set_ylabel('Count')
-        ax6.set_title('Phase Distribution')
-        ax6.grid(True, alpha=0.3)
-        ax6.set_xlim(-180, 180)
-        
         plt.suptitle(f'SR860 Complex Signal Analysis - {Path(self.filename).name}\n'
                     f'Sample Rate: {sample_rate:,.0f} Hz, Duration: {time_seconds[-1]:.1f}s')
         plt.tight_layout()
         
         return fig
+        
 
     def plot_sampling_analysis(self, n_samples: int = 10000):
         """Create plots to analyze sampling characteristics."""
@@ -997,7 +937,7 @@ class SR860BinaryReader:
         
         try:
             # Time series plot
-            fig1 = self.plot_time_series(n_samples=min(10000, info['n_samples']))
+            fig1 = self.plot_time_series(n_samples=info['n_samples'])
             fig1.savefig(output_dir / f"{base_filename}_time_series.png", dpi=150, bbox_inches='tight')
             plt.close(fig1)
         except Exception as e:
@@ -1012,19 +952,12 @@ class SR860BinaryReader:
             except Exception as e:
                 print(f"Warning: Could not save spectrum plot: {e}")
         
-        # Sampling analysis plot
-        try:
-            fig3 = self.plot_sampling_analysis(n_samples=min(10000, info['n_samples']))
-            fig3.savefig(output_dir / f"{base_filename}_sampling_analysis.png", dpi=150, bbox_inches='tight')
-            plt.close(fig3)
-        except Exception as e:
-            print(f"Warning: Could not save sampling analysis plot: {e}")
-        
+       
         # X-Y plots if we have X and Y channels
         if 'X' in self.header['channel_names'] and 'Y' in self.header['channel_names']:
             # X-Y parametric and polar plots
             try:
-                fig4 = self.plot_xy_data(n_samples=min(10000, info['n_samples']))
+                fig4 = self.plot_xy_data(n_samples=1)
                 if fig4:
                     fig4.savefig(output_dir / f"{base_filename}_xy_plots.png", dpi=150, bbox_inches='tight')
                     plt.close(fig4)
@@ -1130,14 +1063,13 @@ def analyze_file(filename: str, plot: bool = True, sample_rate: Optional[float] 
             reader.plot_spectrum(sample_rate=sample_rate)
         
         # Sampling analysis plot (limited to first 10k samples for performance)
-        reader.plot_sampling_analysis(n_samples=min(10000, info['n_samples']))
+        
         
         # X-Y plots if available (show full experiment duration)
         if 'X' in reader.header['channel_names'] and 'Y' in reader.header['channel_names']:
             print("\nGenerating X-Y plots...")
-            reader.plot_xy_data()  # Show full experiment duration
-            reader.plot_complex_analysis()  # Show full experiment duration
-        
+            reader.plot_xy_data()  
+            
         plt.show()
 
 
@@ -1199,14 +1131,20 @@ def main():
     if args.xy_plot:
         reader = SR860BinaryReader(args.filename)
         reader.read_header()
-        
         # Apply forced settings if specified
         if args.force_byte_order or args.force_format:
             byte_order = '<' if args.force_byte_order == 'little' else '>' if args.force_byte_order == 'big' else '<'
             reader.force_byte_order_and_format(byte_order, args.force_format)
+        if args.xy_plot:
+            reader = SR860BinaryReader(args.filename)
+            reader.read_header()
+            ani = reader.plot_xy_data(plot_type=args.xy_plot)
+            plt.show()
+            return
+
             
         if 'X' in reader.header['channel_names'] and 'Y' in reader.header['channel_names']:
-            fig = reader.plot_xy_data(n_samples=args.n_samples or 10000, plot_type=args.xy_plot)
+            fig = reader.plot_xy_data(n_samples=args.n_samples, plot_type=args.xy_plot)
             if fig:
                 plt.show()
         else:
