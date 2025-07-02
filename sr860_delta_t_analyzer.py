@@ -24,6 +24,7 @@ class SR860DeltaTAnalyzer:
         self.data = None
         self.sample_times = None
         self.delta_ts = None
+        self._byte_order = None
         
     def read_header(self) -> Dict[str, Any]:
         """Read and parse file header."""
@@ -31,9 +32,33 @@ class SR860DeltaTAnalyzer:
             # Read header size (4 bytes, little-endian)
             header_size = struct.unpack('<I', f.read(4))[0]
             
+            # Validate header size and try big-endian if needed
+            if header_size > 10000 or header_size < 10:
+                # Try big-endian
+                f.seek(0)
+                header_size = struct.unpack('>I', f.read(4))[0]
+                if header_size > 10000 or header_size < 10:
+                    raise ValueError(f"Invalid header size: {header_size}")
+                self._byte_order = '>'
+                print("Note: Using big-endian byte order for header")
+            else:
+                self._byte_order = '<'
+            
             # Read header data
             header_bytes = f.read(header_size)
-            self.header = ast.literal_eval(header_bytes.decode('utf-8'))
+            try:
+                self.header = ast.literal_eval(header_bytes.decode('utf-8'))
+            except:
+                # Try other encodings
+                try:
+                    self.header = ast.literal_eval(header_bytes.decode('latin-1'))
+                except:
+                    raise ValueError("Could not decode header data")
+            
+            # Add computed fields
+            self.header['header_size'] = header_size + 4
+            self.header['data_offset'] = header_size + 4
+            self.header['byte_order'] = self._byte_order
             
         return self.header
     
@@ -42,29 +67,74 @@ class SR860DeltaTAnalyzer:
         if not self.header:
             self.read_header()
             
-        # Determine data type
+        # Determine data type and byte order
         if self.header['format'] == 0:
             dtype = np.float32
         else:
             dtype = np.int16
             
+        # Get byte order - prioritize detected byte order from header
+        byte_order = '<'  # Default to little-endian
+        if 'detected_little_endian' in self.header and self.header['detected_little_endian'] is not None:
+            # Use detected byte order from packet headers
+            byte_order = '<' if self.header['detected_little_endian'] else '>'
+            print(f"Using detected byte order from packets: {'little-endian' if self.header['detected_little_endian'] else 'big-endian'}")
+        elif 'byte_order' in self.header:
+            # Use byte order from header parsing
+            byte_order = self.header['byte_order']
+        
         bytes_per_sample = self.header['bytes_per_point'] * self.header['points_per_sample']
         
         with open(self.filename, 'rb') as f:
             # Skip header
-            f.seek(4 + len(str(self.header).encode('utf-8')))
+            f.seek(self.header['data_offset'])
             
             # Read all data
             data_bytes = f.read()
             
-            # Convert to numpy array
-            data_flat = np.frombuffer(data_bytes, dtype=dtype)
+            # Convert to numpy array with proper byte order
+            if dtype == np.float32:
+                if byte_order == '<':
+                    data_flat = np.frombuffer(data_bytes, dtype='<f4')
+                else:
+                    data_flat = np.frombuffer(data_bytes, dtype='>f4')
+            else:
+                if byte_order == '<':
+                    data_flat = np.frombuffer(data_bytes, dtype='<i2')
+                else:
+                    data_flat = np.frombuffer(data_bytes, dtype='>i2')
+            
+            # Check for data validity and try alternative byte order if needed
+            if self.header['format'] == 0:  # float32
+                invalid_count = np.sum(~np.isfinite(data_flat))
+                if invalid_count > len(data_flat) * 0.5:  # More than 50% invalid
+                    # Try opposite byte order
+                    if byte_order == '<':
+                        data_flat_alt = np.frombuffer(data_bytes, dtype='>f4')
+                        byte_order_alt = '>'
+                    else:
+                        data_flat_alt = np.frombuffer(data_bytes, dtype='<f4')
+                        byte_order_alt = '<'
+                    
+                    invalid_count_alt = np.sum(~np.isfinite(data_flat_alt))
+                    if invalid_count_alt < invalid_count:
+                        data_flat = data_flat_alt
+                        byte_order = byte_order_alt
+                        print(f"Note: Switched to {'little' if byte_order == '<' else 'big'}-endian byte order for better data validity")
             
             # Reshape based on channel configuration
             actual_samples = len(data_flat) // self.header['points_per_sample']
             self.data = data_flat[:actual_samples * self.header['points_per_sample']].reshape(
                 actual_samples, self.header['points_per_sample']
-            )
+            ).copy()
+            
+            # Final validation and cleaning
+            if self.header['format'] == 0:  # float32
+                # Replace any remaining NaN/inf with zeros for stability
+                invalid_mask = ~np.isfinite(self.data)
+                if np.any(invalid_mask):
+                    print(f"Warning: Found {np.sum(invalid_mask)} invalid values, replacing with zeros")
+                    self.data[invalid_mask] = 0.0
             
         return self.data
     
@@ -416,3 +486,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
