@@ -6,6 +6,7 @@ or force rates - it uses exactly what is configured.
 """
 
 import argparse
+import errno
 import logging
 import multiprocessing as mp
 import numpy as np
@@ -21,9 +22,11 @@ from pathlib import Path
 
 import pyvisa
 
-# Import base functionality from optimal stream
-from sr860_optimal_stream import *
-from sr860_max_stream import StreamReceiver, BinaryFileWriter
+# Import from our clean SR860 class
+from sr860_class import (
+    StreamConfig, StreamChannel, StreamFormat, PacketSize,
+    EnhancedStreamingStats, LossEvent, SR860Class
+)
 
 # Import binary reader for automatic analysis
 from sr860_binary_reader import SR860BinaryReader
@@ -35,52 +38,90 @@ logging.basicConfig(
 )
 
 
-class ProcessStreamReceiver:
-    """Process-based UDP receiver for SR860 streaming data."""
+class TimestampedStreamReceiver:
+    """Enhanced UDP receiver with accurate sample timestamping based on packet counters."""
     
-    def __init__(self, config: StreamConfig, data_queue: mp.Queue, stats_queue: mp.Queue, stop_event: mp.Event):
+    def __init__(self, config: StreamConfig, data_queue: mp.Queue, stats_queue: mp.Queue, 
+                 stop_event: mp.Event, stream_start_time: float, actual_rate_hz: float):
         self.config = config
         self.data_queue = data_queue
         self.stats_queue = stats_queue
         self.stop_event = stop_event
         self.socket = None
         
+        # Timing parameters
+        self.stream_start_time = stream_start_time  # Time when STREAM ON was issued
+        self.actual_rate_hz = actual_rate_hz        # Actual SR860 sample rate
+        
+        # Packet counter tracking
+        self.last_packet_counter = None
+        self.packet_counter_wraps = 0
+        self.total_packets_expected = 0
+        self.gaps_detected = []
+        
+        # Statistics
+        self.total_samples_received = 0
+        self.total_missing_samples = 0
+        
     def run(self):
-        """Main receiver loop running in separate process."""
+        """Main receiver loop with packet counter tracking."""
         # Set up signal handling in the child process
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         
-        # Initialize local statistics
+        # Initialize enhanced statistics with detailed loss analysis
         stats = EnhancedStreamingStats(start_time=time.time())
         
-        # Create and configure socket
+        # Create and configure socket with maximum buffer
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         
-        # Socket optimization for high-throughput
+        # Socket optimization for high-throughput and low latency
         try:
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16*1024*1024)
+            # Increase receive buffer to 64MB
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64*1024*1024)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            
+            # Set high priority
             try:
                 self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_PRIORITY, 6)
             except:
                 pass
+                
+            # Enable timestamp if available
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_TIMESTAMP, 1)
+            except:
+                pass
+                
         except Exception as e:
             logging.warning(f"Some socket optimizations failed: {e}")
         
         self.socket.bind(('', self.config.port))
-        self.socket.settimeout(0.01)  # Short timeout for responsive shutdown
+        self.socket.setblocking(False)  # Non-blocking mode
         
-        logging.info(f"Process-based receiver listening on port {self.config.port}")
+        logging.info(f"Timestamped receiver listening on port {self.config.port}")
         
         # Pre-allocate packet buffer
         packet_buffer = bytearray(self.config.packet_bytes + 100)
         last_stats_update = time.time()
         stats_update_interval = 1.0  # Send stats every second
         
+        # Calculate samples per packet
+        samples_per_packet = self.config.samples_per_packet
+        bytes_per_sample = self.config.bytes_per_point * self.config.points_per_sample
+        
         while not self.stop_event.is_set():
             try:
-                # Receive packet
-                bytes_received = self.socket.recv_into(packet_buffer)
+                # Non-blocking receive
+                try:
+                    bytes_received = self.socket.recv_into(packet_buffer)
+                    receive_timestamp = time.time()
+                except socket.error as e:
+                    if e.errno == socket.errno.EAGAIN or e.errno == socket.errno.EWOULDBLOCK:
+                        # No data available
+                        time.sleep(0.0001)  # Brief sleep to avoid busy-waiting
+                        continue
+                    else:
+                        raise
                 
                 if bytes_received < 4:
                     continue
@@ -100,44 +141,93 @@ class ProcessStreamReceiver:
                 has_overload = bool(status & 0x01)  # Bit 24
                 has_error = bool(status & 0x02)  # Bit 25
                 
-                # Calculate samples
+                # Handle packet counter and detect gaps
+                gap_info = None
+                if self.last_packet_counter is not None:
+                    # Calculate expected counter (handling wrap)
+                    expected_counter = (self.last_packet_counter + 1) & 0xFF
+                    
+                    if packet_counter != expected_counter:
+                        # Gap detected
+                        if packet_counter > self.last_packet_counter:
+                            # Normal gap
+                            missing_packets = packet_counter - self.last_packet_counter - 1
+                        else:
+                            # Counter wrapped
+                            missing_packets = (256 - self.last_packet_counter - 1) + packet_counter
+                            self.packet_counter_wraps += 1
+                        
+                        if missing_packets > 0:
+                            missing_samples = missing_packets * samples_per_packet
+                            self.total_missing_samples += missing_samples
+                            
+                            gap_info = {
+                                'start_packet': self.last_packet_counter,
+                                'end_packet': packet_counter,
+                                'missing_packets': missing_packets,
+                                'missing_samples': missing_samples,
+                                'time': receive_timestamp
+                            }
+                            self.gaps_detected.append(gap_info)
+                            
+                            logging.warning(f"Gap detected: {missing_packets} packets ({missing_samples} samples) missing")
+                    elif packet_counter == 0 and self.last_packet_counter == 255:
+                        # Normal wrap
+                        self.packet_counter_wraps += 1
+                
+                self.last_packet_counter = packet_counter
+                self.total_packets_expected += 1
+                
+                # Calculate global packet index
+                global_packet_idx = self.packet_counter_wraps * 256 + packet_counter
+                
+                # Extract data and calculate timestamps
                 data_bytes = bytes_received - 4
-                bytes_per_sample = self.config.bytes_per_point * self.config.points_per_sample
-                samples_in_packet = data_bytes // bytes_per_sample
+                actual_samples = data_bytes // bytes_per_sample
+                
+                # Create sample data with timestamps
+                sample_data = []
+                for i in range(actual_samples):
+                    # Calculate global sample index
+                    global_sample_idx = global_packet_idx * samples_per_packet + i
+                    
+                    # Calculate timestamp for this sample
+                    sample_timestamp = self.stream_start_time + (global_sample_idx / self.actual_rate_hz)
+                    
+                    # Extract sample data
+                    sample_start = 4 + i * bytes_per_sample
+                    sample_end = sample_start + bytes_per_sample
+                    sample_bytes = packet_buffer[sample_start:sample_end]
+                    
+                    sample_data.append({
+                        'data': bytes(sample_bytes),
+                        'timestamp': sample_timestamp,
+                        'global_idx': global_sample_idx
+                    })
+                
+                self.total_samples_received += actual_samples
                 
                 # Update statistics
-                stats.update_packet(bytes_received, samples_in_packet, packet_counter)
+                stats.update_packet(bytes_received, actual_samples, packet_counter)
                 
                 # Track rate codes
                 if not hasattr(stats, 'rate_code_counts'):
                     stats.rate_code_counts = {}
                 stats.rate_code_counts[sample_rate_code] = stats.rate_code_counts.get(sample_rate_code, 0) + 1
                 
-                # Track byte order and integrity settings from packet headers
-                if not hasattr(stats, 'header_info'):
-                    stats.header_info = {
-                        'is_little_endian': is_little_endian,
-                        'has_integrity_check': has_integrity_check,
-                        'packet_count': 0,
-                        'overload_count': 0,
-                        'error_count': 0
-                    }
-                
-                stats.header_info['packet_count'] += 1
-                if has_overload:
-                    stats.header_info['overload_count'] += 1
-                if has_error:
-                    stats.header_info['error_count'] += 1
-                
-                # Send data packet to writer queue
+                # Send enhanced packet data to writer queue
                 packet_data = {
-                    'data': bytes(packet_buffer[:bytes_received]),
-                    'timestamp': time.time_ns(),
-                    'samples': samples_in_packet,
+                    'type': 'timestamped_packet',
+                    'raw_data': bytes(packet_buffer[:bytes_received]),
+                    'packet_counter': packet_counter,
+                    'global_packet_idx': global_packet_idx,
+                    'samples': sample_data,
+                    'gap_info': gap_info,
                     'is_little_endian': is_little_endian,
                     'has_integrity_check': has_integrity_check,
                     'has_overload': has_overload,
-                    'has_error': has_error
+                    'has_error': has_error,
+                    'receive_timestamp': receive_timestamp
                 }
                 
                 try:
@@ -151,12 +241,19 @@ class ProcessStreamReceiver:
                 if current_time - last_stats_update >= stats_update_interval:
                     stats_summary = {
                         'packets_received': stats.packets_received,
-                        'samples_received': stats.samples_received,
+                        'samples_received': self.total_samples_received,
                         'bytes_received': stats.bytes_received,
                         'sequence_errors': stats.sequence_errors,
                         'receive_errors': stats.errors,
+                        'missing_samples': self.total_missing_samples,
+                        'gaps_detected': len(self.gaps_detected),
+                        'packet_counter_wraps': self.packet_counter_wraps,
                         'rate_code_counts': dict(stats.rate_code_counts) if hasattr(stats, 'rate_code_counts') else {},
-                        'header_info': dict(stats.header_info) if hasattr(stats, 'header_info') else {}
+                        'timing_info': {
+                            'stream_start': self.stream_start_time,
+                            'actual_rate_hz': self.actual_rate_hz,
+                            'total_expected_packets': self.total_packets_expected
+                        }
                     }
                     try:
                         self.stats_queue.put_nowait(stats_summary)
@@ -164,8 +261,6 @@ class ProcessStreamReceiver:
                         pass  # Don't block on stats
                     last_stats_update = current_time
                     
-            except socket.timeout:
-                continue
             except Exception as e:
                 if not self.stop_event.is_set():
                     stats.errors += 1
@@ -175,15 +270,23 @@ class ProcessStreamReceiver:
         if self.socket:
             self.socket.close()
         
-        # Send final stats
+        # Send final stats with gap summary
         final_stats = {
             'packets_received': stats.packets_received,
-            'samples_received': stats.samples_received,
+            'samples_received': self.total_samples_received,
             'bytes_received': stats.bytes_received,
             'sequence_errors': stats.sequence_errors,
             'receive_errors': stats.errors,
+            'missing_samples': self.total_missing_samples,
+            'gaps_detected': len(self.gaps_detected),
+            'gap_details': self.gaps_detected[:10],  # First 10 gaps for summary
+            'packet_counter_wraps': self.packet_counter_wraps,
             'rate_code_counts': dict(stats.rate_code_counts) if hasattr(stats, 'rate_code_counts') else {},
-            'header_info': dict(stats.header_info) if hasattr(stats, 'header_info') else {},
+            'timing_info': {
+                'stream_start': self.stream_start_time,
+                'actual_rate_hz': self.actual_rate_hz,
+                'total_expected_packets': self.total_packets_expected
+            },
             'final': True
         }
         try:
@@ -191,32 +294,36 @@ class ProcessStreamReceiver:
         except:
             pass
         
-        logging.info("Receiver process shutting down")
+        logging.info("Timestamped receiver process shutting down")
 
 
-def receiver_process_entry(config: StreamConfig, data_queue: mp.Queue, stats_queue: mp.Queue, stop_event: mp.Event):
-    """Entry point for receiver process."""
-    receiver = ProcessStreamReceiver(config, data_queue, stats_queue, stop_event)
+def timestamped_receiver_process_entry(config: StreamConfig, data_queue: mp.Queue, 
+                                       stats_queue: mp.Queue, stop_event: mp.Event,
+                                       stream_start_time: float, actual_rate_hz: float):
+    """Entry point for timestamped receiver process."""
+    receiver = TimestampedStreamReceiver(config, data_queue, stats_queue, stop_event,
+                                        stream_start_time, actual_rate_hz)
     receiver.run()
 
 
-class ProcessBinaryFileWriter(threading.Thread):
-    """Writer thread that gets data from the receiver process queue."""
+class TimestampedBinaryFileWriter(threading.Thread):
+    """Writer thread that handles timestamped packets with gap insertion."""
     
     def __init__(self, filename: str, config: StreamConfig, data_queue: mp.Queue, stop_event: mp.Event,
                  actual_rate_hz: Optional[float] = None, rate_divider: Optional[int] = None, 
                  max_rate_hz: Optional[float] = None, detected_little_endian: Optional[bool] = None,
-                 detected_integrity_check: Optional[bool] = None):
-        super().__init__(name="FileWriter")
+                 detected_integrity_check: Optional[bool] = None, stream_start_time: Optional[float] = None):
+        super().__init__(name="TimestampedFileWriter")
         self.filename = filename
         self.config = config
         self.data_queue = data_queue
         self.stop_event = stop_event
         self.samples_written = 0
         self.bytes_written = 0
+        self.gaps_inserted = 0
         self.file = None
         
-        # Store rate information in config object for header writing
+        # Store rate and timing information
         if actual_rate_hz is not None:
             self.config.actual_rate_hz = actual_rate_hz
         if rate_divider is not None:
@@ -227,12 +334,23 @@ class ProcessBinaryFileWriter(threading.Thread):
             self.config.detected_little_endian = detected_little_endian
         if detected_integrity_check is not None:
             self.config.detected_integrity_check = detected_integrity_check
+        if stream_start_time is not None:
+            self.config.stream_start_time = stream_start_time
+            
+        # Track last global sample index for gap detection
+        self.last_global_sample_idx = -1
         
     def run(self):
-        """Main writer loop."""
+        """Main writer loop with gap handling."""
         # Open file and write header
         self.file = open(self.filename, 'wb')
         self._write_header()
+        
+        # Prepare NaN values for gap filling
+        if self.config.format == 0:  # float32
+            nan_bytes = struct.pack('<f', float('nan')) * self.config.points_per_sample
+        else:  # int16
+            nan_bytes = struct.pack('<h', -32768) * self.config.points_per_sample  # Use minimum int16 as "missing"
         
         buffer = bytearray()
         buffer_size = 1024 * 1024  # 1MB buffer
@@ -242,14 +360,33 @@ class ProcessBinaryFileWriter(threading.Thread):
                 # Get data from queue with timeout
                 packet_data = self.data_queue.get(timeout=0.1)
                 
-                # Extract data portion (skip 4-byte header)
-                data = packet_data['data'][4:]
-                samples = packet_data['samples']
+                if packet_data.get('type') != 'timestamped_packet':
+                    logging.warning(f"Unexpected packet type: {packet_data.get('type')}")
+                    continue
                 
-                # Add to buffer
-                buffer.extend(data)
-                self.samples_written += samples
-                self.bytes_written += len(data)
+                # Check for gap before this packet
+                samples = packet_data['samples']
+                if samples:
+                    first_sample_idx = samples[0]['global_idx']
+                    
+                    if self.last_global_sample_idx >= 0:
+                        expected_idx = self.last_global_sample_idx + 1
+                        gap_samples = first_sample_idx - expected_idx
+                        
+                        if gap_samples > 0:
+                            # Insert NaN values for missing samples
+                            logging.info(f"Inserting {gap_samples} NaN samples for gap")
+                            for _ in range(gap_samples):
+                                buffer.extend(nan_bytes)
+                                self.gaps_inserted += 1
+                                self.bytes_written += len(nan_bytes)
+                    
+                    # Write actual sample data
+                    for sample in samples:
+                        buffer.extend(sample['data'])
+                        self.samples_written += 1
+                        self.bytes_written += len(sample['data'])
+                        self.last_global_sample_idx = sample['global_idx']
                 
                 # Flush if buffer is large enough
                 if len(buffer) >= buffer_size:
@@ -259,7 +396,9 @@ class ProcessBinaryFileWriter(threading.Thread):
             except queue.Empty:
                 continue
             except Exception as e:
-                logging.error(f"Writer error: {e}")
+                logging.error(f"Timestamped writer error: {e}")
+                import traceback
+                traceback.print_exc()
                 
         # Final flush
         if buffer:
@@ -269,12 +408,13 @@ class ProcessBinaryFileWriter(threading.Thread):
         if self.file:
             self.file.close()
             
-        logging.info(f"Writer thread finished: {self.samples_written} samples, {self.bytes_written} bytes")
+        logging.info(f"Timestamped writer finished: {self.samples_written} samples written, "
+                    f"{self.gaps_inserted} gap samples inserted, {self.bytes_written} bytes total")
         
     def _write_header(self):
-        """Write file header with metadata."""
+        """Write file header with metadata including timing info."""
         header = {
-            'version': 1,
+            'version': 2,  # Version 2 includes timing information
             'timestamp': time.time(),
             'channel': self.config.channel.value,
             'format': self.config.format.value,
@@ -284,11 +424,15 @@ class ProcessBinaryFileWriter(threading.Thread):
             'port': self.config.port,
             'use_little_endian': self.config.use_little_endian,
             'use_integrity_check': self.config.use_integrity_check,
-            'actual_rate_hz': getattr(self.config, 'actual_rate_hz', None),  # Will be set by caller
-            'rate_divider': getattr(self.config, 'rate_divider', None),      # Will be set by caller
-            'max_rate_hz': getattr(self.config, 'max_rate_hz', None),        # Will be set by caller
-            'detected_little_endian': getattr(self.config, 'detected_little_endian', None),  # From packet headers
-            'detected_integrity_check': getattr(self.config, 'detected_integrity_check', None),  # From packet headers
+            'actual_rate_hz': getattr(self.config, 'actual_rate_hz', None),
+            'rate_divider': getattr(self.config, 'rate_divider', None),
+            'max_rate_hz': getattr(self.config, 'max_rate_hz', None),
+            'detected_little_endian': getattr(self.config, 'detected_little_endian', None),
+            'detected_integrity_check': getattr(self.config, 'detected_integrity_check', None),
+            'stream_start_time': getattr(self.config, 'stream_start_time', None),
+            'receiver_type': 'timestamped',
+            'has_gap_insertion': True,
+            'gap_fill_value': 'NaN' if self.config.format == 0 else -32768
         }
         
         # Write header size (4 bytes) and header data
@@ -301,211 +445,49 @@ class SR860ConfiguredController:
     """Controller that respects SR860's configuration without optimization."""
     
     def __init__(self, ip: str):
-        self.ip = ip
-        self.inst = None
-        self.current_config = {}
+        self.sr860 = SR860Class(ip)
         
     def connect(self) -> bool:
         """Connect to SR860."""
-        try:
-            rm = pyvisa.ResourceManager('@py')
-            resource = f"TCPIP0::{self.ip}::inst0::INSTR"
-            self.inst = rm.open_resource(
-                resource,
-                write_termination="\n",
-                read_termination="\n",
-                timeout=5000,
-            )
-            
-            # Test connection
-            idn = self.inst.query("*IDN?").strip()
-            logging.info(f"Connected to: {idn}")
-            
-            # Clear errors
-            self.inst.write("*CLS")
-            time.sleep(0.1)
-            
-            return True
-            
-        except Exception as e:
-            logging.error(f"Connection failed: {e}")
-            return False
+        return self.sr860.connect()
     
     def read_current_configuration(self) -> Dict[str, Any]:
         """Read the current SR860 streaming configuration."""
-        if not self.inst:
-            raise RuntimeError("Not connected")
-        
-        logging.info("Reading current SR860 configuration...")
-        
-        # Read all streaming parameters
-        channel_idx = int(self.inst.query("STREAMCH?").strip())
-        format_idx = int(self.inst.query("STREAMFMT?").strip())
-        packet_idx = int(self.inst.query("STREAMPCKT?").strip())
-        port = int(self.inst.query("STREAMPORT?").strip())
-        option = int(self.inst.query("STREAMOPTION?").strip())
-        rate_n = int(self.inst.query("STREAMRATE?").strip())
-        max_rate = float(self.inst.query("STREAMRATEMAX?").strip())
-        
-        # Calculate actual rate
-        actual_rate = max_rate / (2 ** rate_n)
-        
-        # Decode options
-        use_little_endian = bool(option & 1)
-        use_integrity_check = bool(option & 2)
-        
-        # Map indices to enums
-        channel_map = {0: StreamChannel.X, 1: StreamChannel.XY, 2: StreamChannel.RT, 3: StreamChannel.XYRT}
-        format_map = {0: StreamFormat.FLOAT32, 1: StreamFormat.INT16}
-        packet_map = {0: PacketSize.SIZE_1024, 1: PacketSize.SIZE_512, 
-                      2: PacketSize.SIZE_256, 3: PacketSize.SIZE_128}
-        
-        self.current_config = {
-            'channel': channel_map.get(channel_idx, StreamChannel.XYRT),
-            'channel_idx': channel_idx,
-            'format': format_map.get(format_idx, StreamFormat.FLOAT32),
-            'format_idx': format_idx,
-            'packet_size': packet_map.get(packet_idx, PacketSize.SIZE_1024),
-            'packet_idx': packet_idx,
-            'port': port,
-            'use_little_endian': use_little_endian,
-            'use_integrity_check': use_integrity_check,
-            'rate_divider': rate_n,
-            'max_rate_hz': max_rate,
-            'actual_rate_hz': actual_rate,
-            'option_value': option
-        }
-        
-        # Create StreamConfig object
-        config = StreamConfig(
-            channel=self.current_config['channel'],
-            format=self.current_config['format'],
-            packet_size=self.current_config['packet_size'],
-            port=port,
-            use_little_endian=use_little_endian,
-            use_integrity_check=use_integrity_check
-        )
-        
-        # Calculate data rates
-        bytes_per_sample = config.bytes_per_point * config.points_per_sample
-        bytes_per_second = actual_rate * bytes_per_sample
-        mbps = (bytes_per_second * 8) / 1e6
-        packets_per_second = actual_rate / config.samples_per_packet if config.samples_per_packet > 0 else 0
-        
-        self.current_config.update({
-            'config_object': config,
-            'bytes_per_sample': bytes_per_sample,
-            'bytes_per_second': bytes_per_second,
-            'mbps': mbps,
-            'packets_per_second': packets_per_second,
-            'samples_per_packet': config.samples_per_packet
-        })
-        
-        logging.info(f"Current configuration:")
-        logging.info(f"  Channel:     {channel_map[channel_idx].name} ({config.points_per_sample} values/sample)")
-        logging.info(f"  Format:      {format_map[format_idx].name} ({config.bytes_per_point} bytes/point)")
-        logging.info(f"  Packet size: {config.packet_bytes} bytes")
-        logging.info(f"  Port:        {port}")
-        logging.info(f"  Rate:        {actual_rate:,.0f} Hz (divider: 2^{rate_n} from max {max_rate:,.0f} Hz)")
-        logging.info(f"  Data rate:   {mbps:.1f} Mbps")
-        logging.info(f"  Packet rate: {packets_per_second:.1f} packets/s")
-        
-        return self.current_config
+        return self.sr860.read_current_configuration()
     
     def apply_configuration(self, config: StreamConfig, rate_divider: Optional[int] = None) -> Dict[str, Any]:
         """Apply a new streaming configuration."""
-        if not self.inst:
-            raise RuntimeError("Not connected")
-        
-        logging.info("Applying new SR860 configuration...")
-        
-        # Apply settings
-        self.inst.write(f"STREAMCH {config.channel.value}")
-        self.inst.write(f"STREAMFMT {config.format.value}")
-        self.inst.write(f"STREAMPCKT {config.packet_size.value}")
-        self.inst.write(f"STREAMPORT {config.port}")
-        self.inst.write(f"STREAMOPTION {config.option_value}")
-        
-        # Apply rate divider if specified
-        if rate_divider is not None:
-            self.inst.write(f"STREAMRATE {rate_divider}")
-        
-        time.sleep(0.2)
-        
-        # Read back actual configuration
-        return self.read_current_configuration()
+        return self.sr860.apply_configuration(config, rate_divider)
     
     def start_streaming(self):
         """Start SR860 streaming."""
-        if not self.inst:
-            raise RuntimeError("Not connected")
-        
-        self.inst.write("STREAM ON")
-        logging.info("SR860 streaming started")
+        self.sr860.start_streaming()
     
     def stop_streaming(self):
         """Stop SR860 streaming."""
-        if self.inst:
-            try:
-                self.inst.write("STREAM OFF")
-                logging.info("SR860 streaming stopped")
-            except:
-                pass
+        self.sr860.stop_streaming()
     
     def close(self):
         """Close connection."""
-        if self.inst:
-            try:
-                self.stop_streaming()
-                self.inst.close()
-            except:
-                pass
+        self.sr860.close()
 
     def set_time_constant(self, time_constant_idx: int) -> Optional[float]:
-        """Set the time constant and return the new maximum streaming rate.
-        
-        Args:
-            time_constant_idx: Time constant index (0-21)
-            
-        Returns:
-            New maximum streaming rate in Hz, or None if failed
-        """
-        if not self.inst:
-            raise RuntimeError("Not connected")
-        
-        try:
-            # Set time constant
-            self.inst.write(f"OFLT {time_constant_idx}")
-            time.sleep(0.5)  # Give SR860 time to update
-            
-            # Get new maximum rate
-            new_max_rate = float(self.inst.query("STREAMRATEMAX?").strip())
-            
-            # Verify it was set
-            actual_tc = int(self.inst.query("OFLT?").strip())
-            if actual_tc != time_constant_idx:
-                logging.warning(f"Time constant set failed: requested {time_constant_idx}, got {actual_tc}")
-            else:
-                logging.info(f"Time constant set to index {time_constant_idx}")
-                logging.info(f"New maximum streaming rate: {new_max_rate:,.0f} Hz")
-            
-            return new_max_rate
-            
-        except Exception as e:
-            logging.error(f"Failed to set time constant: {e}")
-            return None
+        """Set the time constant and return the new maximum streaming rate."""
+        return self.sr860.set_time_constant(time_constant_idx)
 
 
 def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None, 
                                rate_divider: Optional[int] = None, duration: float = 10.0,
                                use_current_config: bool = True, time_constant: Optional[int] = None,
-                               auto_analysis: bool = True):
-    """Worker function for streaming at configured rate using process-based architecture."""
+                               auto_analysis: bool = True, detailed_loss_analysis: bool = False):
+    """Worker function for streaming at configured rate using timestamped receiver."""
     
-    logging.info(f"Process-based streaming worker started for {ip}")
+    logging.info(f"Timestamped streaming worker started for {ip}")
     
     # Initialize start_time early to avoid UnboundLocalError
     start_time = time.time()
+    actual_rate = 0  # Initialize early to avoid UnboundLocalError
+    stream_start_time = None  # Time when STREAM ON is issued
     
     # Create controller
     controller = SR860ConfiguredController(ip)
@@ -566,28 +548,35 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
         logging.info("STREAMING CONFIGURATION SUMMARY")
         logging.info("="*60)
         logging.info(f"Mode:              {'Current Config' if use_current_config else 'User Specified'}")
+        logging.info(f"Receiver:          Timestamped receiver with packet counter tracking")
         logging.info(f"Actual rate:       {actual_rate:,.0f} Hz")
         logging.info(f"Expected duration: {duration:.1f} s")
         logging.info(f"Expected samples:  {int(actual_rate * duration):,}")
         logging.info(f"Expected data:     {config_info['mbps'] * duration * 0.125:.1f} MB")
         
-        # Start receiver process
+        # Always use timestamped receiver
+        logging.info("\nUsing TIMESTAMPED receiver with packet counter tracking")
+        # Capture stream start time just before starting
+        stream_start_time = time.time()
+        
+        # Start timestamped receiver process
         receiver_process = mp_context.Process(
-            target=receiver_process_entry,
-            args=(config, data_queue, stats_queue, stop_event),
-            name=f"SR860_Receiver_{ip}"
+            target=timestamped_receiver_process_entry,
+            args=(config, data_queue, stats_queue, stop_event, stream_start_time, actual_rate),
+            name=f"SR860_TimestampedReceiver_{ip}"
         )
         receiver_process.start()
         logging.info(f"Started receiver process (PID: {receiver_process.pid})")
         
-        # Start writer thread
-        writer_thread = ProcessBinaryFileWriter(
+        # Start timestamped writer thread
+        writer_thread = TimestampedBinaryFileWriter(
             filename, config, data_queue, stop_event, 
             actual_rate_hz=actual_rate, 
             rate_divider=config_info['rate_divider'], 
             max_rate_hz=config_info['max_rate_hz'],
             detected_little_endian=config_info['use_little_endian'],
-            detected_integrity_check=config_info['use_integrity_check']
+            detected_integrity_check=config_info['use_integrity_check'],
+            stream_start_time=stream_start_time
         )
         writer_thread.start()
         logging.info("Started writer thread")
@@ -595,7 +584,8 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
         # Give receiver time to initialize
         time.sleep(1)
         
-        # Start streaming
+        # Start streaming - capture exact time
+        stream_start_time = time.time()
         controller.start_streaming()
         
         # Monitor for duration
@@ -612,7 +602,10 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
             'sequence_errors': 0,
             'receive_errors': 0,
             'rate_code_counts': {},
-            'header_info': {}
+            'header_info': {},
+            'missing_samples': 0,
+            'gaps_detected': 0,
+            'gap_details': []
         }
         
         # Track detected header information
@@ -642,6 +635,12 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
                         total_stats['sequence_errors'] = stats_update['sequence_errors']
                         total_stats['receive_errors'] = stats_update['receive_errors']
                         total_stats['rate_code_counts'] = stats_update['rate_code_counts']
+                        
+                        # Update gap information
+                        if 'missing_samples' in stats_update:
+                            total_stats['missing_samples'] = stats_update['missing_samples']
+                        if 'gaps_detected' in stats_update:
+                            total_stats['gaps_detected'] = stats_update['gaps_detected']
                         
                         # Update header information if available
                         if 'header_info' in stats_update:
@@ -673,11 +672,16 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
                 if len(total_stats['rate_code_counts']) > 1:
                     rate_stability = f"VARIABLE ({len(total_stats['rate_code_counts'])} rates)"
                 
+                # Include gap info
+                gap_info = ""
+                if total_stats.get('gaps_detected', 0) > 0:
+                    gap_info = f", gaps: {total_stats['gaps_detected']}"
+                
                 logging.info(
                     f"Progress: {total_stats['samples_received']:,} samples, "
                     f"{actual_mbps:.1f} Mbps, "
                     f"efficiency: {efficiency:.1f}%, "
-                    f"rate: {rate_stability}"
+                    f"rate: {rate_stability}{gap_info}"
                 )
                 last_log_time = current_time
             
@@ -739,11 +743,12 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
         sample_loss_percent = (sample_loss / expected_samples * 100) if expected_samples > 0 else 0
         
         logging.info("\n" + "="*60)
-        logging.info("CONFIGURED STREAMING FINAL STATISTICS")
+        logging.info("TIMESTAMPED STREAMING FINAL STATISTICS")
         logging.info("="*60)
         
         logging.info(f"\nConfiguration:")
         logging.info(f"  Mode:              {'Current Config' if use_current_config else 'User Specified'}")
+        logging.info(f"  Receiver:          Timestamped receiver with packet counter tracking")
         logging.info(f"  Channel:           {config.channel.name}")
         logging.info(f"  Format:            {config.format.name}")
         logging.info(f"  Packet size:       {config.packet_bytes} bytes")
@@ -775,6 +780,20 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
         logging.info("\nErrors:")
         logging.info(f"  Receive errors:  {total_stats['receive_errors']}")
         logging.info(f"  Sequence errors: {total_stats['sequence_errors']}")
+        
+        # Gap analysis
+        if 'gaps_detected' in total_stats:
+            logging.info("\nGap Analysis:")
+            logging.info(f"  Gaps detected:    {total_stats['gaps_detected']}")
+            logging.info(f"  Missing samples:  {total_stats.get('missing_samples', 0):,}")
+            
+            # Show first few gaps if any
+            if 'gap_details' in total_stats and total_stats['gap_details']:
+                logging.info(f"  First {min(5, len(total_stats['gap_details']))} gaps:")
+                for i, gap in enumerate(total_stats['gap_details'][:5]):
+                    logging.info(f"    Gap {i+1}: {gap['missing_packets']} packets "
+                               f"({gap['missing_samples']} samples) between packets "
+                               f"{gap['start_packet']}->{gap['end_packet']}")
         
         # Header information analysis
         if 'header_info' in total_stats and total_stats['header_info']:
@@ -857,6 +876,36 @@ def configured_streaming_worker(ip: str, config: Optional[StreamConfig] = None,
             logging.info("   • Time constant may be limiting the actual streaming rate")
             logging.info("   • Use STREAMRATEMAX? to check maximum allowed rate")
             logging.info("   • Adjust STREAMRATE n to reduce rate if needed")
+        
+        # Display detailed loss analysis if losses occurred and requested
+        if has_packet_loss and detailed_loss_analysis:
+            logging.info("\n" + "="*60)
+            logging.info("DETAILED SAMPLE LOSS ANALYSIS")
+            logging.info("="*60)
+            
+            # Get the detailed loss report from the receiver's stats
+            try:
+                # We need to get the stats from the receiver process
+                # For now, we'll show a summary of what we have
+                logging.info(f"Total sequence errors: {total_stats['sequence_errors']}")
+                logging.info(f"Missing samples: {total_stats.get('missing_samples', 0):,}")
+                logging.info(f"Gaps detected: {total_stats.get('gaps_detected', 0)}")
+                
+                if 'gap_details' in total_stats and total_stats['gap_details']:
+                    logging.info("\nRecent gap details:")
+                    for i, gap in enumerate(total_stats['gap_details'][:5]):
+                        logging.info(f"  Gap {i+1}: {gap['missing_packets']} packets "
+                                   f"({gap['missing_samples']} samples) between packets "
+                                   f"{gap['start_packet']}->{gap['end_packet']}")
+                
+                logging.info("\nUse --detailed-loss-analysis for full pattern analysis")
+                
+            except Exception as e:
+                logging.warning(f"Could not generate detailed loss report: {e}")
+        elif has_packet_loss:
+            logging.info(f"\n⚠️  SAMPLE LOSSES DETECTED:")
+            logging.info(f"   {total_stats['sequence_errors']} sequence errors detected")
+            logging.info(f"   Use --detailed-loss-analysis for full analysis")
 
         # Automatic analysis
         if auto_analysis and filename and Path(filename).exists():
@@ -950,6 +999,10 @@ def main():
     parser.add_argument("--no-auto-analysis", action="store_true",
                         help="Disable automatic analysis and plotting after streaming")
     
+    # Detailed loss analysis option
+    parser.add_argument("--detailed-loss-analysis", action="store_true",
+                        help="Enable detailed loss pattern analysis and reporting")
+    
     args = parser.parse_args()
     
     # Determine if we should use current config or apply new settings
@@ -1004,7 +1057,8 @@ def main():
             duration=args.duration,
             use_current_config=use_current,
             time_constant=args.time_constant,
-            auto_analysis=not args.no_auto_analysis
+            auto_analysis=not args.no_auto_analysis,
+            detailed_loss_analysis=args.detailed_loss_analysis
         )
     except KeyboardInterrupt:
         logging.info("Streaming stopped by user")
