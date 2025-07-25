@@ -966,7 +966,7 @@ def main():
     )
     
     # Connection
-    parser.add_argument("--ip", default="192.168.1.156", help="SR860 IP address")
+    parser.add_argument("--ip", default="192.168.1.18", help="SR860 IP address")
     parser.add_argument("--duration", type=float, default=10.0, help="Duration in seconds")
     
     # Configuration options (all optional - if not specified, use current)

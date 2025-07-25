@@ -10,7 +10,6 @@ import ast
 import struct
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import animation
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 from datetime import datetime
