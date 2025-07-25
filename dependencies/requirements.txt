@@ -1,8 +1,10 @@
 # Core dependencies for SR860 streaming and analysis
 numpy>=1.20
 matplotlib>=3.4
+plotly>=5.0  # For interactive plotting
 pyvisa>=1.12
 pyvisa-py>=0.5
+scipy>=1.7  # For linear regression and statistical analysis
 
 # Optional: for pandas-based CSV analysis (not strictly required by main scripts)
 pandas>=1.3  # Only needed if you want to use pandas for further analysis
