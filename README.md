@@ -378,33 +378,33 @@ flowchart LR
     end
 
     B --> D1[Device 1 Config]
-    B --> D2[Device 2 Config]
+    B --> D2[Device 2 Config] 
 
     D1 --> E1[Queue₁ & Event₁]
     D2 --> E2[Queue₂ & Event₂]
 
-    E1 --> F1[Receiver Proc₁]
-    E2 --> F2[Receiver Proc₂]
+    E1 --> F1[Receiver Proc₁: Bind UDP, Recv/Timestamp/Enqueue]
+    E2 --> F2[Receiver Proc₂: Bind UDP, Recv/Timestamp/Enqueue]
 
-    F1 -->|data₁| G1((data_q₁)) --> H1[Writer Thread₁]
-    F2 -->|data₂| G2((data_q₂)) --> H2[Writer Thread₂]
+    F1 -->|data₁| G1((data_q₁)) --> H1[Writer Thread₁: Dequeue & Write Binary]
+    F2 -->|data₂| G2((data_q₂)) --> H2[Writer Thread₂: Dequeue & Write Binary]
 
-    F1 -->|stats₁| I1((stats_q₁)) --> J[Stats Collector]
+    F1 -->|stats₁| I1((stats_q₁)) --> J[Stats Collector Thread: Aggregate]
     F2 -->|stats₂| I2((stats_q₂)) --> J
 
-    J --> K[Aggregate & Log Dashboard]
+    J --> K[Aggregate & Log Dashboard: Print Rates/Loss]
 
     A --> B --> C
     C --> F1
-    C --> F2
+    C --> F2  
 
-    %% Shutdown
-    K --> L{Shutdown?}
+
+    K --> L[Shutdown]
     L -->|yes| M1[set Event₁]
     L -->|yes| M2[set Event₂]
     M1 --> N1[Join Proc₁ & Thread₁]
     M2 --> N2[Join Proc₂ & Thread₂]
-    N1 --> O[End]
+    N1 --> O[End: Flush Files, Cleanup]
     N2 --> O
 ```
 ## Support
