@@ -2,13 +2,25 @@
 
 ## Quick Start
 
+### Single Device Streaming
 After configuring your SR860 lock-in amplifier, use this script to stream data:
 
 ```bash
 python sr860_configured_stream.py --ip 192.168.1.156 --duration 30
 ```
 
-This will stream data for 30 seconds using your SR860's current configuration and save it to a binary file.
+### Multi-Device Streaming
+For streaming from multiple SR860 devices simultaneously:
+
+```bash
+# Create configuration for 2 devices
+python sr860_multi_config.py create --devices 2 --output my_config.json
+
+# Start multi-device streaming
+python sr860_multi_stream.py my_config.json
+```
+
+This system supports advanced Linux performance optimizations for high-throughput, low-latency streaming.
 
 ## Overview
 
@@ -291,6 +303,30 @@ Attempts maximum rate streaming with optional throttling to prevent packet loss.
 ### `sr860_binary_reader.py` - Data Analysis
 Comprehensive analysis tool for binary files created by the streaming scripts.
 
+### Multi-Device Streaming System
+
+The system now includes advanced multi-device streaming capabilities:
+
+#### `sr860_multi_config.py` - Configuration Management
+- Create and validate multi-device configurations
+- Automatic CPU affinity optimization
+- Network performance tuning settings
+- JSON-based configuration files
+
+#### `sr860_multi_stream.py` - Multi-Device Controller
+- Simultaneous streaming from multiple SR860 devices
+- Process-per-device architecture for isolation
+- Real-time scheduling with SCHED_FIFO priorities
+- Live dashboard with aggregated statistics
+- Optional central logging
+
+#### `sr860_system_optimizer.py` - System Optimization
+- CPU isolation configuration
+- Network stack tuning (RSS/RFS/XPS)
+- IRQ affinity management
+- Performance governor settings
+- Generates optimization scripts
+
 ## Troubleshooting
 
 ### Common Issues
@@ -356,6 +392,7 @@ TowardWorking/
 
 ## System Requirements
 
+### Basic Requirements
 - Python 3.7+
 - PyVISA for instrument communication
 - NumPy for data processing
@@ -363,11 +400,86 @@ TowardWorking/
 - Network connection to SR860
 - Sufficient disk space for data files
 
+### Multi-Device Streaming Requirements
+- Linux operating system (for real-time features)
+- Multiple CPU cores (2+ cores per device recommended)
+- Root access for system optimizations
+- High-performance network interface
+- psutil for system monitoring
+
+### Advanced Performance Requirements
+- CPU isolation support (isolcpus kernel parameter)
+- Real-time scheduling capabilities
+- Network interface with RSS/RFS support
+- Sufficient RAM for large socket buffers
+
 ## Dependencies
 
 ```bash
+# Basic dependencies
 pip install pyvisa numpy matplotlib
+
+# Additional for multi-device streaming
+pip install psutil
 ```
+
+## Multi-Device Setup Guide
+
+### 1. System Preparation
+
+For optimal multi-device performance:
+
+```bash
+# Check system capabilities
+python sr860_system_optimizer.py --check
+
+# Generate optimization script
+sudo python sr860_system_optimizer.py --generate-script --interface eth0
+
+# Apply optimizations
+sudo ./optimize_sr860_system.sh
+```
+
+### 2. CPU Isolation (Optional but Recommended)
+
+Edit `/etc/default/grub`:
+```
+GRUB_CMDLINE_LINUX="isolcpus=domain,2-7 nohz_full=2-7 rcu_nocbs=2-7"
+```
+
+Then update and reboot:
+```bash
+sudo update-grub
+sudo reboot
+```
+
+### 3. Create Multi-Device Configuration
+
+```bash
+# Interactive configuration for 3 devices
+python sr860_multi_config.py create --devices 3 --output three_devices.json
+
+# Validate configuration
+python sr860_multi_config.py validate three_devices.json
+```
+
+### 4. Run Multi-Device Streaming
+
+```bash
+# Standard user (limited RT features)
+python sr860_multi_stream.py three_devices.json
+
+# With full RT capabilities (recommended)
+sudo python sr860_multi_stream.py three_devices.json --optimize-system
+```
+
+### 5. Monitor Performance
+
+The system provides a real-time dashboard showing:
+- Per-device sample rates and efficiency
+- Network throughput
+- Error detection
+- System resource usage
 ## Process per instrument (next iteration) 
 ```mermaid 
 flowchart LR
